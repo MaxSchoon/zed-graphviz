@@ -72,28 +72,19 @@ pub fn write_atomic(path: &Path, bytes: &[u8], access: Access) -> io::Result<()>
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let prefix = format!(".{name}.");
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(&prefix).suffix(".tmp");
-    // The mode passed at creation is reduced by the umask, like any new file.
-    #[cfg(unix)]
-    if access == Access::Shared {
-        use std::os::unix::fs::PermissionsExt;
-        builder.permissions(fs::Permissions::from_mode(0o666));
-    }
-    let mut tmp = builder.tempfile_in(dir)?;
+    // Created readable only by the user (on Unix) and widened only after
+    // the contents are written, so nobody else can read them early.
+    let mut tmp = tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(".tmp")
+        .tempfile_in(dir)?;
     tmp.write_all(bytes)?;
-    // Replacing a regular file keeps its ordinary permission bits; setuid,
-    // setgid and sticky are never carried over to the new contents.
     #[cfg(unix)]
     if access == Access::Shared {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(existing) = fs::symlink_metadata(path) {
-            if existing.is_file() {
-                let mode = existing.permissions().mode() & 0o777;
-                tmp.as_file()
-                    .set_permissions(fs::Permissions::from_mode(mode))?;
-            }
-        }
+        let mode = export_mode(path, dir)?;
+        tmp.as_file()
+            .set_permissions(fs::Permissions::from_mode(mode))?;
     }
     #[cfg(not(unix))]
     let _ = access;
@@ -117,6 +108,26 @@ pub fn write_atomic(path: &Path, bytes: &[u8], access: Access) -> io::Result<()>
             Err(e) => return Err(e.error),
         }
     }
+}
+
+/// The mode an export gets: an existing regular file keeps its ordinary
+/// permission bits (never setuid, setgid or sticky); a new file gets what
+/// any new file in `dir` gets, 0666 less the umask.
+#[cfg(unix)]
+fn export_mode(path: &Path, dir: &Path) -> io::Result<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(existing) = fs::symlink_metadata(path) {
+        if existing.is_file() {
+            return Ok(existing.permissions().mode() & 0o777);
+        }
+    }
+    // Reading the umask would change it for every thread, so create an
+    // empty file with 0666 and see what the system made of it.
+    let probe = tempfile::Builder::new()
+        .prefix(".mode.")
+        .permissions(fs::Permissions::from_mode(0o666))
+        .tempfile_in(dir)?;
+    Ok(probe.as_file().metadata()?.permissions().mode() & 0o777)
 }
 
 #[cfg(test)]
@@ -228,6 +239,25 @@ mod tests {
         );
         write_atomic(&special, b"new", Access::Shared).unwrap();
         assert_eq!(full_mode(&special), 0o754);
+
+        // A private export stays private.
+        let private = dir.path().join("private.png");
+        fs::write(&private, b"old").unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(export_mode(&private, dir.path()).unwrap(), 0o600);
+        write_atomic(&private, b"new", Access::Shared).unwrap();
+        assert_eq!(mode(&private), 0o600);
+
+        // The mode helper: new files get the creation mode, existing ones
+        // their rwx bits only.
+        assert_eq!(
+            export_mode(&dir.path().join("absent.svg"), dir.path()).unwrap(),
+            mode(&reference)
+        );
+        let odd = dir.path().join("odd.svg");
+        fs::write(&odd, b"x").unwrap();
+        fs::set_permissions(&odd, fs::Permissions::from_mode(0o6751)).unwrap();
+        assert_eq!(export_mode(&odd, dir.path()).unwrap(), 0o751);
 
         let preview = dir.path().join("preview.png");
         write_atomic(&preview, b"png", Access::Private).unwrap();
