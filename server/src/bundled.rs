@@ -4,41 +4,66 @@
 //! stdin, SVG on stdout, messages on stderr and a non-zero exit on error.
 //! It gets no filesystem, network or environment access.
 //!
-//! Compiling the module takes a few seconds, so the compiled code is cached
-//! under the cache directory, keyed by the module's SHA-256 and wasmtime's
-//! compatibility hash (which covers the wasmtime version and settings).
+//! `build.rs` compiles the module to native code for the target ahead of
+//! time, so the server only needs wasmtime's runtime to load it.
 
-use crate::cache;
+use crate::engine_config;
 use crate::render::SvgOutput;
-use sha2::{Digest, Sha256};
-use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use wasmtime::{
-    Config, Engine, InstancePre, Linker, Module, Store, StoreLimits, StoreLimitsBuilder,
-};
+use wasmtime::{Config, Engine, InstancePre, Linker, Module, ResourceLimiter, Store, Trap};
 use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::{I32Exit, WasiCtxBuilder};
 
-static WASM: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/graphviz-wasm/graphviz.wasm"
-));
+/// The module compiled by `build.rs`.
+static COMPILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/graphviz.cwasm"));
 
-/// Native stack the guest may use. Callers must run renders on a thread
-/// with at least `2 * WASM_STACK` of stack (see `server::RENDER_STACK`).
-pub const WASM_STACK: usize = 16 << 20;
 /// Linear memory a single render may use.
-const MAX_MEMORY: usize = 1 << 30;
+pub const MAX_MEMORY: usize = 1 << 30;
 /// Largest SVG we accept on stdout.
 const MAX_STDOUT: usize = 256 << 20;
 const MAX_STDERR: usize = 1 << 20;
 
+/// The SHA-256 of the embedded `graphviz.wasm`, as hex.
+pub fn wasm_sha256() -> &'static str {
+    env!("GRAPHVIZ_WASM_SHA256")
+}
+
+/// Caps linear memory and remembers whether the cap was what stopped a
+/// render, so the user gets a clear message instead of a generic failure.
+struct MemoryCap {
+    max: usize,
+    hit: bool,
+}
+
+impl ResourceLimiter for MemoryCap {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        if desired > self.max {
+            self.hit = true;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        _desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(true)
+    }
+}
+
 struct State {
     wasi: WasiP1Ctx,
-    limits: StoreLimits,
+    memory: MemoryCap,
 }
 
 struct Bundled {
@@ -63,27 +88,24 @@ fn instance() -> Result<&'static Bundled, String> {
         .map_err(Clone::clone)
 }
 
-/// The SHA-256 of the embedded module, as hex.
-pub fn wasm_sha256() -> String {
-    Sha256::digest(WASM)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
 fn load() -> wasmtime::Result<Bundled> {
+    let started = Instant::now();
     let mut config = Config::new();
-    config.epoch_interruption(true);
-    // Graphviz recurses deeply on large graphs (rank assignment, for one);
-    // the 512 KiB default overflows where native `dot` with an 8 MiB stack
-    // does not. The render threads are spawned with room for this.
-    config.max_wasm_stack(WASM_STACK);
-    config.async_stack_size(2 * WASM_STACK);
+    engine_config::configure(&mut config);
     let engine = Engine::new(&config)?;
-    let module = load_module(&engine)?;
+    // SAFETY: `COMPILED` was produced by `Engine::precompile_module` in
+    // build.rs, with the same wasmtime version (pinned in Cargo.toml) and the
+    // same `engine_config::configure` settings, for this target. wasmtime
+    // also checks the version and settings and refuses a mismatch.
+    let module = unsafe { Module::deserialize(&engine, COMPILED) }?;
     let mut linker: Linker<State> = Linker::new(&engine);
     wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |s: &mut State| &mut s.wasi)?;
     let pre = linker.instantiate_pre(&module)?;
+    crate::log(format!(
+        "bundled Graphviz: loaded {} KiB of compiled code in {} ms",
+        COMPILED.len() / 1024,
+        started.elapsed().as_millis()
+    ));
     Ok(Bundled {
         engine,
         pre,
@@ -91,94 +113,21 @@ fn load() -> wasmtime::Result<Bundled> {
     })
 }
 
-fn module_cache_path(engine: &Engine) -> Option<PathBuf> {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    engine.precompile_compatibility_hash().hash(&mut hasher);
-    let sha = wasm_sha256();
-    Some(cache::cache_root()?.join("modules").join(format!(
-        "graphviz-{}-{:016x}.cwasm",
-        &sha[..16],
-        hasher.finish()
-    )))
-}
-
-fn load_module(engine: &Engine) -> wasmtime::Result<Module> {
-    let path = module_cache_path(engine);
-    if let Some(path) = path.as_ref().filter(|p| p.is_file()) {
-        let started = Instant::now();
-        // SAFETY: the file is only ever written by `Module::serialize` below,
-        // into the user's own cache directory, under a name that includes the
-        // engine's compatibility hash. wasmtime still checks the header and
-        // rejects artifacts from another version or configuration.
-        match unsafe { Module::deserialize_file(engine, path) } {
-            Ok(module) => {
-                crate::log(format!(
-                    "bundled Graphviz: loaded compiled module {} in {} ms",
-                    path.display(),
-                    started.elapsed().as_millis()
-                ));
-                return Ok(module);
-            }
-            Err(e) => crate::log(format!(
-                "bundled Graphviz: ignoring cached module {}: {e}",
-                path.display()
-            )),
-        }
-    }
-
-    let started = Instant::now();
-    let module = Module::new(engine, WASM)?;
-    crate::log(format!(
-        "bundled Graphviz: compiled {} KiB module in {} ms",
-        WASM.len() / 1024,
-        started.elapsed().as_millis()
-    ));
-    if let Some(path) = path {
-        match module.serialize() {
-            Ok(bytes) => match cache::write_atomic(&path, &bytes) {
-                Ok(()) => {
-                    remove_stale_modules(&path);
-                    crate::log(format!(
-                        "bundled Graphviz: cached compiled module at {}",
-                        path.display()
-                    ));
-                }
-                Err(e) => crate::log(format!(
-                    "bundled Graphviz: could not cache compiled module: {e}"
-                )),
-            },
-            Err(e) => crate::log(format!("bundled Graphviz: could not serialize module: {e}")),
-        }
-    }
-    Ok(module)
-}
-
-/// Removes compiled modules left behind by older versions.
-fn remove_stale_modules(current: &std::path::Path) {
-    let (Some(dir), Some(name)) = (current.parent(), current.file_name()) else {
-        return;
-    };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let file = entry.file_name();
-        let file = file.to_string_lossy();
-        if file.starts_with("graphviz-")
-            && file.ends_with(".cwasm")
-            && *file != *name.to_string_lossy()
-        {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
-/// Compiles (or loads) the module ahead of the first render.
+/// Loads the module ahead of the first render.
 pub fn warm_up() {
     let _ = instance();
 }
 
 pub fn run(source: &str, args: &[String], timeout: Duration) -> SvgOutput {
+    run_with_memory(source, args, timeout, MAX_MEMORY)
+}
+
+fn run_with_memory(
+    source: &str,
+    args: &[String],
+    timeout: Duration,
+    max_memory: usize,
+) -> SvgOutput {
     let failed = |msg: String| SvgOutput {
         svg: None,
         stderr: String::new(),
@@ -205,10 +154,13 @@ pub fn run(source: &str, args: &[String], timeout: Duration) -> SvgOutput {
         .args(args);
     let state = State {
         wasi: builder.build_p1(),
-        limits: StoreLimitsBuilder::new().memory_size(MAX_MEMORY).build(),
+        memory: MemoryCap {
+            max: max_memory,
+            hit: false,
+        },
     };
     let mut store = Store::new(&bundled.engine, state);
-    store.limiter(|s| &mut s.limits);
+    store.limiter(|s| &mut s.memory);
     store.set_epoch_deadline(1);
 
     // Interrupt the guest when the timeout passes; dropping `done` first
@@ -230,6 +182,7 @@ pub fn run(source: &str, args: &[String], timeout: Duration) -> SvgOutput {
     });
     drop(done);
     let timed_out = timer.join().unwrap_or(false);
+    let memory_hit = store.data().memory.hit;
     drop(store);
 
     let stdout = stdout.contents().to_vec();
@@ -238,37 +191,131 @@ pub fn run(source: &str, args: &[String], timeout: Duration) -> SvgOutput {
         Ok(()) => 0,
         Err(e) => match e.downcast_ref::<I32Exit>() {
             Some(exit) => exit.0,
-            None if timed_out => {
-                return SvgOutput {
-                    svg: None,
-                    stderr,
-                    timed_out: true,
-                    failure: None,
-                }
-            }
             None => {
+                let interrupted = timed_out && e.downcast_ref::<Trap>() == Some(&Trap::Interrupt);
+                if interrupted {
+                    crate::log(format!(
+                        "bundled Graphviz: stopped after {} ms",
+                        timeout.as_millis()
+                    ));
+                    return SvgOutput {
+                        svg: None,
+                        stderr,
+                        timed_out: true,
+                        failure: None,
+                    };
+                }
                 crate::log(format!("bundled Graphviz trapped: {e:?}"));
-                let reason = match e.downcast_ref::<wasmtime::Trap>() {
-                    Some(wasmtime::Trap::StackOverflow) => {
-                        "ran out of stack space on this graph; the system dot may still render it"
-                            .to_string()
-                    }
-                    Some(trap) => format!("crashed: {trap}"),
-                    None => format!("failed: {}", e.root_cause()),
-                };
                 return SvgOutput {
                     svg: None,
                     stderr,
                     timed_out: false,
-                    failure: Some(format!("the built-in Graphviz {reason}")),
+                    failure: Some(failure_message(&e, memory_hit, max_memory)),
                 };
             }
         },
     };
+    let svg = (exit == 0 && !stdout.is_empty()).then_some(stdout);
+    let failure = (svg.is_none() && memory_hit).then(|| memory_message(max_memory));
+    if let Some(message) = &failure {
+        crate::log(format!("bundled Graphviz: exit status {exit}: {message}"));
+    }
     SvgOutput {
-        svg: (exit == 0 && !stdout.is_empty()).then_some(stdout),
+        svg,
         stderr,
         timed_out: false,
-        failure: None,
+        failure,
+    }
+}
+
+fn memory_message(max_memory: usize) -> String {
+    format!(
+        "the built-in Graphviz needs more than {} MiB of memory for this graph and was stopped",
+        max_memory >> 20
+    )
+}
+
+/// A message for a render that ended in a trap rather than an exit status.
+fn failure_message(error: &wasmtime::Error, memory_hit: bool, max_memory: usize) -> String {
+    if memory_hit {
+        return memory_message(max_memory);
+    }
+    match error.downcast_ref::<Trap>() {
+        Some(Trap::StackOverflow) => {
+            "the built-in Graphviz ran out of stack space on this graph; the system dot may still render it"
+                .to_string()
+        }
+        Some(Trap::MemoryOutOfBounds) => {
+            "the built-in Graphviz crashed (out-of-bounds memory access); the system dot may still render this graph"
+                .to_string()
+        }
+        Some(Trap::UnreachableCodeReached) => {
+            "the built-in Graphviz stopped on an internal error".to_string()
+        }
+        Some(trap) => format!("the built-in Graphviz crashed: {trap}"),
+        None => format!("the built-in Graphviz failed: {}", error.root_cause()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = "digraph { alpha -> beta }";
+
+    fn args() -> Vec<String> {
+        vec!["-Tsvg".to_string()]
+    }
+
+    /// Runs `f` on a thread with as much stack as the server's render threads.
+    fn on_render_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(4 * engine_config::WASM_STACK)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn precompiled_module_loads_and_renders() {
+        let out = on_render_thread(|| run(SAMPLE, &args(), Duration::from_secs(30)));
+        assert!(out.failure.is_none(), "{:?}", out.failure);
+        let svg = String::from_utf8(out.svg.expect("an SVG")).unwrap();
+        assert!(
+            svg.contains(">alpha</text>") && svg.contains(">beta</text>"),
+            "{svg}"
+        );
+    }
+
+    #[test]
+    fn memory_cap_stops_the_render_with_a_clear_message() {
+        // The module starts with about 8.2 MiB (its 8 MiB C stack plus
+        // data); 9 MiB leaves too little heap for a few thousand edges.
+        let mut text = String::from("digraph {\n");
+        for i in 0..2000 {
+            text.push_str(&format!("  n{i} -> n{};\n", i + 1));
+        }
+        text.push('}');
+        let out = on_render_thread(move || {
+            run_with_memory(&text, &args(), Duration::from_secs(60), 9 << 20)
+        });
+        assert!(out.svg.is_none());
+        let failure = out.failure.expect("a failure message");
+        assert!(failure.contains("more than 9 MiB of memory"), "{failure}");
+    }
+
+    #[test]
+    fn traps_become_readable_messages() {
+        let message = |trap: Trap| failure_message(&wasmtime::Error::from(trap), false, MAX_MEMORY);
+        assert!(message(Trap::StackOverflow).contains("ran out of stack space"));
+        assert!(message(Trap::MemoryOutOfBounds).contains("out-of-bounds memory access"));
+        assert!(message(Trap::UnreachableCodeReached).contains("internal error"));
+        let capped = failure_message(
+            &wasmtime::Error::from(Trap::UnreachableCodeReached),
+            true,
+            MAX_MEMORY,
+        );
+        assert!(capped.contains("more than 1024 MiB of memory"), "{capped}");
     }
 }

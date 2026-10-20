@@ -7,6 +7,8 @@ mod bundled;
 mod cache;
 mod diagnostics;
 mod document;
+#[cfg(feature = "bundled")]
+mod engine_config;
 mod render;
 mod server;
 mod settings;
