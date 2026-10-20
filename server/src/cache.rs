@@ -50,7 +50,8 @@ pub fn preview_path(root: &Path, key: &str, stem: &str) -> PathBuf {
 pub enum Access {
     /// Only the user (previews in the cache).
     Private,
-    /// Readable by everyone, like a file the user saved (exports).
+    /// Like a file the user saved (exports): a new file gets the usual
+    /// creation mode (0666 less the umask) and a replaced file keeps its mode.
     Shared,
 }
 
@@ -70,16 +71,25 @@ pub fn write_atomic(path: &Path, bytes: &[u8], access: Access) -> io::Result<()>
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let mut tmp = tempfile::Builder::new()
-        .prefix(&format!(".{name}."))
-        .suffix(".tmp")
-        .tempfile_in(dir)?;
-    tmp.write_all(bytes)?;
+    let prefix = format!(".{name}.");
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix).suffix(".tmp");
+    // The mode passed at creation is reduced by the umask, like any new file.
     #[cfg(unix)]
     if access == Access::Shared {
         use std::os::unix::fs::PermissionsExt;
-        tmp.as_file()
-            .set_permissions(fs::Permissions::from_mode(0o644))?;
+        builder.permissions(fs::Permissions::from_mode(0o666));
+    }
+    let mut tmp = builder.tempfile_in(dir)?;
+    tmp.write_all(bytes)?;
+    // Replacing a regular file keeps its permissions.
+    #[cfg(unix)]
+    if access == Access::Shared {
+        if let Ok(existing) = fs::symlink_metadata(path) {
+            if existing.is_file() {
+                tmp.as_file().set_permissions(existing.permissions())?;
+            }
+        }
     }
     #[cfg(not(unix))]
     let _ = access;
@@ -179,7 +189,31 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
-        let mode = fs::metadata(&link).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exports_get_the_default_mode_or_keep_the_existing_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        // What any program creating a file here gets (0666 less the umask).
+        let reference = dir.path().join("reference");
+        fs::File::create(&reference).unwrap();
+
+        let new = dir.path().join("new.svg");
+        write_atomic(&new, b"svg", Access::Shared).unwrap();
+        assert_eq!(mode(&new), mode(&reference));
+
+        let existing = dir.path().join("existing.png");
+        fs::write(&existing, b"old").unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o640)).unwrap();
+        write_atomic(&existing, b"new", Access::Shared).unwrap();
+        assert_eq!(fs::read(&existing).unwrap(), b"new");
+        assert_eq!(mode(&existing), 0o640);
+
+        let preview = dir.path().join("preview.png");
+        write_atomic(&preview, b"png", Access::Private).unwrap();
+        assert_eq!(mode(&preview), 0o600);
     }
 }
