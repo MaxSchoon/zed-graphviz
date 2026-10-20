@@ -899,3 +899,64 @@ fn exit_is_prompt_with_bundled_renders_waiting() {
     let took = started.elapsed();
     assert!(took < Duration::from_secs(5), "exit took {took:?}");
 }
+
+/// A 20x20 opaque PNG of one colour.
+fn solid_png(rgb: [u8; 3]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut bytes, 20, 20);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer
+            .write_image_data(&[rgb[0], rgb[1], rgb[2], 255].repeat(400))
+            .unwrap();
+    }
+    bytes
+}
+
+#[test]
+fn hover_thumbnails_are_cached_per_folder() {
+    let mut client = Client::start(Options {
+        settings: json!({"renderer": "dot", "appearance": "light"}),
+        ..Options::default()
+    });
+    // The same text in two folders. The image is inside the first folder,
+    // so only the first document may draw it.
+    let red = client.workspace.path().join("red");
+    let blue = client.workspace.path().join("blue");
+    std::fs::create_dir(&red).unwrap();
+    std::fs::create_dir(&blue).unwrap();
+    let picture = red.join("pic.png");
+    std::fs::write(&picture, solid_png([255, 0, 0])).unwrap();
+    let text = format!(
+        "digraph g {{\n  n [shape=box label=\"\" image=\"{}\"];\n}}\n",
+        picture.display()
+    );
+    let mut thumbnails = Vec::new();
+    for folder in ["red", "blue"] {
+        let uri = client.open(&format!("{folder}/g.dot"), &text);
+        let hover = client.request(
+            "textDocument/hover",
+            json!({"textDocument": {"uri": uri}, "position": {"line": 0, "character": 2}}),
+        );
+        let value = hover["contents"]["value"].as_str().unwrap().to_string();
+        let start = value.find("base64,").unwrap() + "base64,".len();
+        let end = start + value[start..].find(')').unwrap();
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(&value[start..end])
+            .unwrap();
+        thumbnails.push(decode_png(&png));
+    }
+    let red_pixels = |image: &common::Image| image.count(|p| p[0] > 200 && p[1] < 60 && p[2] < 60);
+    assert!(
+        red_pixels(&thumbnails[0]) > 50,
+        "the image is missing in its own folder"
+    );
+    assert_eq!(
+        red_pixels(&thumbnails[1]),
+        0,
+        "the other folder got the first folder's cached thumbnail"
+    );
+    client.shutdown();
+}

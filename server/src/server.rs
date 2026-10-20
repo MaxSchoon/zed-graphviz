@@ -909,6 +909,14 @@ impl Server {
         dark.hash(&mut hasher);
         renderer.hash(&mut hasher);
         self.settings.scale.to_bits().hash(&mut hasher);
+        // The same text draws different images from a different folder.
+        let images = self.image_policy(doc.source_path.as_deref());
+        let canonical = |p: &Option<PathBuf>| {
+            p.as_ref()
+                .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+        };
+        canonical(&images.base).hash(&mut hasher);
+        canonical(&images.root).hash(&mut hasher);
         let hash = hasher.finish();
         if let Some((_, markdown)) = self.hover_cache.iter().find(|(h, _)| *h == hash) {
             let markdown = markdown.clone();
@@ -1388,4 +1396,26 @@ fn work(job: Job) -> Event {
             png_ms,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server(workspace_roots: Vec<PathBuf>) -> Server {
+        let (sender, _receiver) = unbounded();
+        let mut server = Server::new(sender, &InitializeParams::default());
+        server.workspace_roots = workspace_roots;
+        server
+    }
+
+    #[test]
+    fn image_policy_uses_the_innermost_workspace_folder() {
+        let s = server(vec![PathBuf::from("/w"), PathBuf::from("/w/inner")]);
+        let policy = s.image_policy(Some(Path::new("/w/inner/sub/g.dot")));
+        assert_eq!(policy.base, Some(PathBuf::from("/w/inner/sub")));
+        assert_eq!(policy.root, Some(PathBuf::from("/w/inner")));
+        let outside = s.image_policy(Some(Path::new("/elsewhere/g.dot")));
+        assert_eq!(outside.root, Some(PathBuf::from("/elsewhere")));
+    }
 }
