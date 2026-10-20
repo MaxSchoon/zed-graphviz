@@ -82,12 +82,16 @@ pub fn write_atomic(path: &Path, bytes: &[u8], access: Access) -> io::Result<()>
     }
     let mut tmp = builder.tempfile_in(dir)?;
     tmp.write_all(bytes)?;
-    // Replacing a regular file keeps its permissions.
+    // Replacing a regular file keeps its ordinary permission bits; setuid,
+    // setgid and sticky are never carried over to the new contents.
     #[cfg(unix)]
     if access == Access::Shared {
+        use std::os::unix::fs::PermissionsExt;
         if let Ok(existing) = fs::symlink_metadata(path) {
             if existing.is_file() {
-                tmp.as_file().set_permissions(existing.permissions())?;
+                let mode = existing.permissions().mode() & 0o777;
+                tmp.as_file()
+                    .set_permissions(fs::Permissions::from_mode(mode))?;
             }
         }
     }
@@ -211,6 +215,19 @@ mod tests {
         write_atomic(&existing, b"new", Access::Shared).unwrap();
         assert_eq!(fs::read(&existing).unwrap(), b"new");
         assert_eq!(mode(&existing), 0o640);
+
+        // Special bits on the replaced file are dropped, rwx bits kept.
+        let full_mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let special = dir.path().join("special.svg");
+        fs::write(&special, b"old").unwrap();
+        fs::set_permissions(&special, fs::Permissions::from_mode(0o6754)).unwrap();
+        assert_eq!(
+            full_mode(&special) & 0o6000,
+            0o6000,
+            "setup: setuid/setgid set"
+        );
+        write_atomic(&special, b"new", Access::Shared).unwrap();
+        assert_eq!(full_mode(&special), 0o754);
 
         let preview = dir.path().join("preview.png");
         write_atomic(&preview, b"png", Access::Private).unwrap();
