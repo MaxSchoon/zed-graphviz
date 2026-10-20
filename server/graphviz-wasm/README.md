@@ -35,11 +35,25 @@ produce the same file regardless of the directory they run in. For
 reference, a build on macOS (arm64) produced:
 
 ```
-d1ad8ec50a4c76a486edc41294028b97a98f75a918beb6b45965f0ba1783d210  graphviz.wasm
+6ee71fa97b2ff6c5979250c1c1fa0a07fbdf8fe27b80cc42ede4a5c23a98ba2d  graphviz.wasm
 ```
 
 To upgrade an input, change its version and SHA-256 in `build.sh`, check that
 the patches still apply, and update `THIRD_PARTY_NOTICES.md`.
+
+## Stack size
+
+The module is linked with an 8 MiB C stack (`-Wl,-z,stack-size=8388608`),
+the default thread stack of a native `dot`. wasm-ld would otherwise reserve
+only 64 KiB, and Graphviz recurses deeply on large graphs: rank assignment
+in `dot` and the tree walks in the other engines are recursive. The stack
+sits at the start of linear memory, so an overflow is a memory fault
+(a trap) rather than silent corruption, but 64 KiB is far less than the
+graphs people preview need. The initial linear memory is about 8.2 MiB as
+a result; pages that are never touched cost no physical memory.
+
+The host must also give the module enough native stack for its call depth;
+the preview server allows 16 MiB (`max_wasm_stack`).
 
 ## Patches
 

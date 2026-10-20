@@ -165,7 +165,10 @@ CC="$WASI_SDK_PATH/bin/clang --target=$TARGET --sysroot=$SYSROOT"
 CXX="$WASI_SDK_PATH/bin/clang++ --target=$TARGET --sysroot=$SYSROOT"
 GV_CFLAGS="$COMMON_CFLAGS"
 GV_CXXFLAGS="-Oz -fno-exceptions -ffile-prefix-map=$SRC/= -ffile-prefix-map=$BUILD/= -D_WASI_EMULATED_SIGNAL"
-GV_LDFLAGS="-L$PREFIX/lib"
+# wasm-ld reserves only 64 KiB for the C stack by default. Graphviz recurses
+# deeply on large graphs, and an overflow of that stack is a memory fault in
+# the module, so give it 8 MiB, the default thread stack of native `dot`.
+GV_LDFLAGS="-L$PREFIX/lib -Wl,-z,stack-size=8388608"
 GV_LIBS="-lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid"
 
 mkdir -p "$BUILD/graphviz"
