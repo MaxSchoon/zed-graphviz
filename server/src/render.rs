@@ -381,7 +381,14 @@ fn human_size(bytes: usize) -> String {
 
 /// Address space a native `dot` may use, on Linux.
 #[cfg(target_os = "linux")]
-pub const DOT_MEMORY_LIMIT: u64 = 2 << 30;
+pub const DOT_MEMORY_LIMIT: libc::rlim_t = 2 << 30;
+
+/// The `(soft, hard)` limits to set: the inherited ones lowered to `cap`,
+/// never raised (raising a hard limit is not allowed and would fail).
+#[cfg(any(target_os = "linux", test))]
+pub fn clamp_limits<T: Ord + Copy>(soft: T, hard: T, cap: T) -> (T, T) {
+    (soft.min(cap), hard.min(cap))
+}
 
 /// Caps the address space of a native `dot` on Linux. Other platforms have
 /// no equivalent per-process limit that is safe to set here, so there `dot`
@@ -389,17 +396,31 @@ pub const DOT_MEMORY_LIMIT: u64 = 2 << 30;
 #[cfg(target_os = "linux")]
 fn limit_memory(command: &mut Command) {
     use std::os::unix::process::CommandExt;
+    // The child inherits the server's limits, so read them here, where a
+    // problem can be logged, and only apply the result in the child.
+    let mut inherited = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit only writes the struct it is given.
+    if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut inherited) } != 0 {
+        crate::log(format!(
+            "warning: could not read the address-space limit ({}); dot runs without a memory cap",
+            std::io::Error::last_os_error()
+        ));
+        return;
+    }
+    let (soft, hard) = clamp_limits(inherited.rlim_cur, inherited.rlim_max, DOT_MEMORY_LIMIT);
+    let limit = libc::rlimit {
+        rlim_cur: soft,
+        rlim_max: hard,
+    };
     // SAFETY: the closure runs in the child between fork and exec and only
-    // calls setrlimit, which is async-signal-safe.
+    // calls setrlimit, which is async-signal-safe. Lowering limits is always
+    // permitted; if it still fails, dot runs uncapped rather than not at all.
     unsafe {
-        command.pre_exec(|| {
-            let limit = libc::rlimit {
-                rlim_cur: DOT_MEMORY_LIMIT as libc::rlim_t,
-                rlim_max: DOT_MEMORY_LIMIT as libc::rlim_t,
-            };
-            if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+        command.pre_exec(move || {
+            let _ = libc::setrlimit(libc::RLIMIT_AS, &limit);
             Ok(())
         });
     }
@@ -790,6 +811,19 @@ mod tests {
             .unwrap();
         assert_eq!(kept.len(), 1000);
         assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn memory_limits_are_lowered_never_raised() {
+        let cap: u64 = 2 << 30;
+        // Unlimited (RLIM_INFINITY is all ones on Linux): both get the cap.
+        assert_eq!(clamp_limits(u64::MAX, u64::MAX, cap), (cap, cap));
+        // A lower inherited hard limit is kept, so setrlimit cannot fail.
+        assert_eq!(clamp_limits(1 << 30, 1 << 30, cap), (1 << 30, 1 << 30));
+        assert_eq!(clamp_limits(1 << 29, u64::MAX, cap), (1 << 29, cap));
+        assert_eq!(clamp_limits(u64::MAX, 3 << 30, cap), (cap, cap));
+        let (soft, hard) = clamp_limits(1 << 30, 3 << 29, cap);
+        assert!(soft <= hard);
     }
 
     #[cfg(target_os = "linux")]
