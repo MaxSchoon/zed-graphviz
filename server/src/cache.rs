@@ -10,7 +10,6 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Overrides the platform cache directory (used by the tests).
 pub const CACHE_DIR_ENV: &str = "GRAPHVIZ_PREVIEW_CACHE_DIR";
@@ -46,10 +45,23 @@ pub fn preview_path(root: &Path, key: &str, stem: &str) -> PathBuf {
         .join(format!("{stem}.png"))
 }
 
+/// Who may read a written file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    /// Only the user (previews in the cache).
+    Private,
+    /// Readable by everyone, like a file the user saved (exports).
+    Shared,
+}
+
 /// Writes `bytes` to `path` through a temporary file in the same directory
 /// and a rename, so a viewer never reads a half-written image.
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
+///
+/// The temporary file has a random name and is created exclusively (and
+/// readable only by the user on Unix), so a planted file or symlink can
+/// never redirect the write. The rename replaces `path` itself, never what
+/// a symlink at `path` points to.
+pub fn write_atomic(path: &Path, bytes: &[u8], access: Access) -> io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
@@ -58,28 +70,39 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let tmp = dir.join(format!(
-        ".{name}.{}.{}.tmp",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let result = (|| {
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(bytes)?;
-        drop(file);
-        match fs::rename(&tmp, path) {
-            // Windows refuses to replace a file another program holds open
-            // without delete sharing; overwrite it in place instead.
-            Err(e) if cfg!(windows) && e.kind() == io::ErrorKind::PermissionDenied => {
-                fs::copy(&tmp, path).map(|_| ())
-            }
-            other => other,
-        }
-    })();
-    if tmp.exists() {
-        let _ = fs::remove_file(&tmp);
+    let mut tmp = tempfile::Builder::new()
+        .prefix(&format!(".{name}."))
+        .suffix(".tmp")
+        .tempfile_in(dir)?;
+    tmp.write_all(bytes)?;
+    #[cfg(unix)]
+    if access == Access::Shared {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o644))?;
     }
-    result
+    #[cfg(not(unix))]
+    let _ = access;
+
+    // Windows refuses to replace a file another program has open without
+    // delete sharing; retry briefly, then give up rather than write in place.
+    let mut attempts = 0;
+    loop {
+        match tmp.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(e)
+                if cfg!(windows)
+                    && e.error.kind() == io::ErrorKind::PermissionDenied
+                    && attempts < 5 =>
+            {
+                attempts += 1;
+                tmp = e.file;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            // Dropping the temporary file deletes it.
+            Err(e) => return Err(e.error),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -120,10 +143,43 @@ mod tests {
     fn atomic_write_replaces_and_leaves_no_temp_files() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("g.png");
-        write_atomic(&path, b"one").unwrap();
-        write_atomic(&path, b"two").unwrap();
+        write_atomic(&path, b"one", Access::Private).unwrap();
+        write_atomic(&path, b"two", Access::Private).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"two");
         let entries: Vec<_> = fs::read_dir(path.parent().unwrap()).unwrap().collect();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planted_symlinks_are_never_followed() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        fs::write(&victim, b"keep me").unwrap();
+        let target = dir.path().join("out").join("g.png");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        // Symlinks at every name an earlier, predictable scheme would use.
+        for n in 0..32 {
+            let name = format!(".g.png.{}.{n}.tmp", std::process::id());
+            symlink(&victim, target.parent().unwrap().join(name)).unwrap();
+        }
+        write_atomic(&target, b"preview", Access::Private).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"keep me");
+        assert_eq!(fs::read(&target).unwrap(), b"preview");
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // A symlink at the destination is replaced, not written through.
+        let link = dir.path().join("link.svg");
+        symlink(&victim, &link).unwrap();
+        write_atomic(&link, b"export", Access::Shared).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"keep me");
+        assert!(!fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let mode = fs::metadata(&link).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
     }
 }

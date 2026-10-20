@@ -1088,7 +1088,7 @@ impl Server {
         let Some(path) = job.preview_path.as_ref() else {
             return;
         };
-        match cache::write_atomic(path, png) {
+        match cache::write_atomic(path, png, cache::Access::Private) {
             Ok(()) => {
                 doc.applied_gen = job.gen;
                 log(format!(
@@ -1164,7 +1164,7 @@ impl Server {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| dest.display().to_string());
         match bytes {
-            Some(bytes) => match cache::write_atomic(dest, bytes) {
+            Some(bytes) => match cache::write_atomic(dest, bytes, cache::Access::Shared) {
                 Ok(()) => {
                     log(format!(
                         "export: wrote {} bytes to {}",
