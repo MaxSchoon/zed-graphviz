@@ -6,7 +6,37 @@
 
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
+use std::fs;
 use std::path::Path;
+
+/// Written last into a finished installation; a folder without it is an
+/// interrupted one and gets reinstalled.
+pub const MARKER: &str = ".installed";
+/// Shipped in every archive next to the binary.
+pub const NOTICES: &str = "THIRD_PARTY_NOTICES.md";
+
+/// Whether `dir` holds a finished installation with a non-empty `binary`.
+pub fn is_complete(dir: &Path, binary: &str) -> bool {
+    dir.join(MARKER).is_file()
+        && fs::metadata(dir.join(binary)).is_ok_and(|m| m.is_file() && m.len() > 0)
+}
+
+/// Checks an unpacked `staging` folder (the binary is there and not empty,
+/// the notices are there), marks it finished and renames it to `dir`,
+/// replacing whatever unfinished installation was there.
+pub fn commit_install(staging: &Path, dir: &Path, binary: &str) -> Result<(), String> {
+    if !fs::metadata(staging.join(binary)).is_ok_and(|m| m.is_file() && m.len() > 0) {
+        return Err(format!("the archive has no usable {binary}"));
+    }
+    if !staging.join(NOTICES).is_file() {
+        return Err(format!("the archive has no {NOTICES}"));
+    }
+    fs::write(staging.join(MARKER), b"").map_err(|e| e.to_string())?;
+    if dir.exists() {
+        fs::remove_dir_all(dir).map_err(|e| format!("could not remove {}: {e}", dir.display()))?;
+    }
+    fs::rename(staging, dir).map_err(|e| format!("could not move the installation into place: {e}"))
+}
 
 /// Reads the checksum for `file_name` from a `sha256sum`-style file
 /// (`<64 hex digits>  <file name>`).
@@ -131,5 +161,57 @@ mod tests {
         assert!(unpack_tar_gz(&evil, &dir).is_err());
         assert!(!dir.parent().unwrap().join("escaped").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("zed-graphviz-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_half_extracted_installation_is_not_complete() {
+        let root = scratch("half");
+        let dir = root.join("graphviz-preview-v1");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Extraction stopped after the binary: no marker.
+        std::fs::write(dir.join("graphviz-preview"), b"binary").unwrap();
+        assert!(!is_complete(&dir, "graphviz-preview"));
+        // A marker but a truncated binary.
+        std::fs::write(dir.join(MARKER), b"").unwrap();
+        std::fs::write(dir.join("graphviz-preview"), b"").unwrap();
+        assert!(!is_complete(&dir, "graphviz-preview"));
+
+        // A fresh install replaces it.
+        let staging = root.join("graphviz-preview-v1.staging-1");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("graphviz-preview"), b"binary").unwrap();
+        std::fs::write(staging.join(NOTICES), b"notices").unwrap();
+        commit_install(&staging, &dir, "graphviz-preview").unwrap();
+        assert!(is_complete(&dir, "graphviz-preview"));
+        assert!(!staging.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_incomplete_archive_is_not_installed() {
+        let root = scratch("incomplete");
+        let dir = root.join("graphviz-preview-v1");
+        let staging = root.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("graphviz-preview"), b"binary").unwrap();
+        assert!(
+            commit_install(&staging, &dir, "graphviz-preview").is_err(),
+            "no notices"
+        );
+        std::fs::write(staging.join(NOTICES), b"notices").unwrap();
+        std::fs::write(staging.join("graphviz-preview"), b"").unwrap();
+        assert!(
+            commit_install(&staging, &dir, "graphviz-preview").is_err(),
+            "empty binary"
+        );
+        assert!(!dir.exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

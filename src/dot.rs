@@ -1,6 +1,7 @@
 mod archive;
 
 use std::fs;
+use std::path::Path;
 use zed::settings::LspSettings;
 use zed_extension_api::{self as zed, serde_json, LanguageServerId, Result};
 
@@ -8,9 +9,7 @@ const DOT_LANGUAGE_SERVER: &str = "dot-language-server";
 const PREVIEW_SERVER: &str = "graphviz-preview";
 const PREVIEW_REPO: &str = "gabeins/zed-graphviz";
 
-struct DotLspExtension {
-    cached_preview_binary: Option<String>,
-}
+struct DotLspExtension;
 
 impl DotLspExtension {
     fn language_server_binary_path(
@@ -34,16 +33,8 @@ impl DotLspExtension {
         if let Some(path) = worktree.which(PREVIEW_SERVER) {
             return Ok(path);
         }
-
-        if let Some(path) = &self.cached_preview_binary {
-            if fs::metadata(path).is_ok_and(|stat| stat.is_file()) {
-                return Ok(path.clone());
-            }
-        }
-
-        let path = download_preview_server(language_server_id)?;
-        self.cached_preview_binary = Some(path.clone());
-        Ok(path)
+        // Checks for a finished installation first, so this is cheap.
+        download_preview_server(language_server_id)
     }
 }
 
@@ -70,7 +61,7 @@ fn download_preview_server(language_server_id: &LanguageServerId) -> Result<Stri
     let version = env!("CARGO_PKG_VERSION");
     let version_dir = format!("{PREVIEW_SERVER}-v{version}");
     let binary_path = format!("{version_dir}/{binary_name}");
-    if fs::metadata(&binary_path).is_ok_and(|stat| stat.is_file()) {
+    if archive::is_complete(Path::new(&version_dir), binary_name) {
         return Ok(binary_path);
     }
 
@@ -96,21 +87,31 @@ fn download_preview_server(language_server_id: &LanguageServerId) -> Result<Stri
         language_server_id,
         &zed::LanguageServerInstallationStatus::Downloading,
     );
+    // Unpack into a staging folder next to the final one and move it into
+    // place only once it is complete, so an interrupted install is never
+    // mistaken for a finished one.
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let staging = format!("{version_dir}.staging-{unique}");
     let installed = install_verified(
         &asset.download_url,
         &asset_name,
         &checksum.download_url,
-        &version_dir,
-    );
+        &staging,
+    )
+    .and_then(|()| zed::make_file_executable(&format!("{staging}/{binary_name}")))
+    .and_then(|()| {
+        archive::commit_install(Path::new(&staging), Path::new(&version_dir), binary_name)
+    });
     if let Err(e) = installed {
-        fs::remove_dir_all(&version_dir).ok();
+        fs::remove_dir_all(&staging).ok();
         zed::set_language_server_installation_status(
             language_server_id,
             &zed::LanguageServerInstallationStatus::Failed(e.clone()),
         );
         return Err(e);
     }
-    zed::make_file_executable(&binary_path)?;
 
     // Remove binaries of earlier versions.
     if let Ok(entries) = fs::read_dir(".") {
@@ -160,7 +161,7 @@ fn install_verified(
         fs::read(&archive_path).map_err(|e| format!("could not read {archive_path}: {e}"))?;
     archive::verify_sha256(&bytes, &expected)
         .map_err(|e| format!("refusing the downloaded {archive_name}: {e}"))?;
-    archive::unpack_tar_gz(&bytes, std::path::Path::new(dir))
+    archive::unpack_tar_gz(&bytes, Path::new(dir))
         .map_err(|e| format!("could not unpack {archive_name}: {e}"))?;
     fs::remove_file(&archive_path).ok();
     fs::remove_file(&checksum_path).ok();
@@ -176,9 +177,7 @@ fn server_settings(server: &str, worktree: &zed::Worktree) -> serde_json::Value 
 
 impl zed::Extension for DotLspExtension {
     fn new() -> Self {
-        Self {
-            cached_preview_binary: None,
-        }
+        Self
     }
 
     fn language_server_command(
