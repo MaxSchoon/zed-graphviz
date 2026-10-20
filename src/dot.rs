@@ -21,21 +21,14 @@ impl DotLspExtension {
             .ok_or(String::from("Ensure dot-language-server is in PATH"))
     }
 
-    /// Finds the preview server: the `binary.path` setting, then PATH, then a
-    /// binary downloaded from this extension's GitHub release.
+    /// Finds the preview server on PATH, or downloads it from this
+    /// extension's GitHub release. A `binary` setting for the server is
+    /// handled by Zed itself before the extension is asked.
     fn preview_binary_path(
         &mut self,
         language_server_id: &LanguageServerId,
         worktree: &zed::Worktree,
     ) -> Result<String> {
-        if let Some(path) = LspSettings::for_worktree(PREVIEW_SERVER, worktree)
-            .ok()
-            .and_then(|settings| settings.binary)
-            .and_then(|binary| binary.path)
-        {
-            return Ok(path);
-        }
-
         if let Some(path) = worktree.which(PREVIEW_SERVER) {
             return Ok(path);
         }
@@ -148,24 +141,13 @@ impl zed::Extension for DotLspExtension {
         worktree: &zed::Worktree,
     ) -> Result<zed::Command> {
         if language_server_id.as_ref() == PREVIEW_SERVER {
-            let binary = LspSettings::for_worktree(PREVIEW_SERVER, worktree)
-                .ok()
-                .and_then(|settings| settings.binary);
-            let args = binary
-                .as_ref()
-                .and_then(|binary| binary.arguments.clone())
-                .unwrap_or_default();
             // The shell environment carries the user's PATH, so a `dot`
             // installed with Homebrew or a package manager is found even
             // when Zed was started from the Dock.
-            let mut env = worktree.shell_env();
-            if let Some(extra) = binary.and_then(|binary| binary.env) {
-                env.extend(extra);
-            }
             return Ok(zed::Command {
                 command: self.preview_binary_path(language_server_id, worktree)?,
-                args,
-                env,
+                args: Vec::new(),
+                env: worktree.shell_env(),
             });
         }
 

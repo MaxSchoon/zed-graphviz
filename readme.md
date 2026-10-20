@@ -106,9 +106,10 @@ Settings go in your Zed `settings.json`. All of them are optional:
 | `appearance`  | `"auto"` | `"auto"` follows the OS light/dark setting; `"light"` or `"dark"` fixes it.                            |
 
 To use your own build of the preview server, put `graphviz-preview` on your
-`PATH` or set `"lsp": {"graphviz-preview": {"binary": {"path": "..."}}}`.
-Otherwise Zed downloads the server for your platform from this repository's
-GitHub releases the first time a DOT file is opened.
+`PATH`, or set `"lsp": {"graphviz-preview": {"binary": {"path": "..."}}}`;
+Zed itself honours that setting (in trusted projects only), like it does for
+every language server. Otherwise Zed downloads the server for your platform
+from this repository's GitHub releases the first time a DOT file is opened.
 
 ### Privacy
 
