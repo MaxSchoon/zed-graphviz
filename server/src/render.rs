@@ -268,6 +268,7 @@ fn run_dot(path: &Path, source: &str, args: &[String], deadline: Deadline) -> Sv
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
+    limit_memory(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
@@ -377,6 +378,35 @@ fn human_size(bytes: usize) -> String {
         format!("{} KiB", bytes >> 10)
     }
 }
+
+/// Address space a native `dot` may use, on Linux.
+#[cfg(target_os = "linux")]
+pub const DOT_MEMORY_LIMIT: u64 = 2 << 30;
+
+/// Caps the address space of a native `dot` on Linux. Other platforms have
+/// no equivalent per-process limit that is safe to set here, so there `dot`
+/// is bounded only by the render timeout.
+#[cfg(target_os = "linux")]
+fn limit_memory(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs in the child between fork and exec and only
+    // calls setrlimit, which is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: DOT_MEMORY_LIMIT as libc::rlim_t,
+                rlim_max: DOT_MEMORY_LIMIT as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn limit_memory(_command: &mut Command) {}
 
 /// Reads `pipe` to the end, keeping at most `cap` bytes; raises `overflow`
 /// and stops reading when there is more.
@@ -540,6 +570,11 @@ pub fn svg_to_png(
     let png = pixmap
         .encode_png()
         .map_err(|e| RasterError::Failed(format!("PNG encoding failed: {e}")))?;
+    // Drawing and encoding cannot be interrupted; a result that comes in
+    // late is dropped like any other overrun.
+    if deadline.passed() {
+        return Err(RasterError::TimedOut);
+    }
     let refused_images = std::mem::take(&mut *refused.lock().unwrap_or_else(|p| p.into_inner()));
     Ok(Raster {
         png,
@@ -755,5 +790,18 @@ mod tests {
             .unwrap();
         assert_eq!(kept.len(), 1000);
         assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_dot_runs_under_a_memory_limit() {
+        // The same setup run_dot uses, applied to a shell that reports the
+        // limit (in KiB).
+        let mut command = Command::new("sh");
+        command.args(["-c", "ulimit -v"]);
+        limit_memory(&mut command);
+        let out = command.output().unwrap();
+        let reported = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(reported, (DOT_MEMORY_LIMIT / 1024).to_string());
     }
 }

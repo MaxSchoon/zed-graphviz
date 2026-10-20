@@ -36,6 +36,9 @@ which = "8"
 wasmtime = { version = "=49.0.4", optional = true, default-features = false, features = ["runtime", "std"] }
 wasmtime-wasi = { version = "=49.0.4", optional = true, default-features = false, features = ["p1"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 # Cranelift backends for every release target (x86_64 and aarch64), so a
 # build can compile Graphviz for a target other than the machine it runs on.

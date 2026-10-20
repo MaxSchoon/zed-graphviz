@@ -51,7 +51,8 @@ Hover the `graph`/`digraph` line to see a thumbnail of the graph.
 
 The code actions menu also has **Export graph as SVG** and **Export graph as
 PNG**, which write `<name>.svg` or `<name>.png` next to the `.dot` file.
-Exports always use Graphviz's normal light colours.
+Exports always use Graphviz's normal light colours. An exported SVG keeps
+the image references (`image=`) exactly as Graphviz wrote them.
 
 ### Renderer
 
@@ -104,6 +105,10 @@ Settings go in your Zed `settings.json`. All of them are optional:
 | `timeout_ms`  | `10000`  | A render that takes longer is stopped, so a huge graph cannot keep a CPU busy.                         |
 | `scale`       | `2.0`    | Pixel density of the preview image.                                                                    |
 | `appearance`  | `"auto"` | `"auto"` follows the OS light/dark setting; `"light"` or `"dark"` fixes it.                            |
+
+Besides the timeout, the built-in Graphviz may use at most 1 GiB of
+memory per render. A system `dot` is limited to 2 GiB of address space on
+Linux; on macOS and Windows its memory is not limited, only its time.
 
 To use your own build of the preview server, put `graphviz-preview` on your
 `PATH`, or set `"lsp": {"graphviz-preview": {"binary": {"path": "..."}}}`;

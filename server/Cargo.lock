@@ -1003,6 +1003,7 @@ dependencies = [
  "crossbeam-channel",
  "dark-light",
  "dirs",
+ "libc",
  "lsp-server",
  "lsp-types",
  "png",
