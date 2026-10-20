@@ -103,7 +103,7 @@ jobs:
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: graphviz-wasm
+          name: graphviz-wasm-release
           path: |
             server/graphviz-wasm/graphviz.wasm
             server/graphviz-wasm/graphviz.wasm.sha256
@@ -140,7 +140,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: graphviz-wasm
+          name: graphviz-wasm-release
           path: server/graphviz-wasm
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:

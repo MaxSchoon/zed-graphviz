@@ -37,6 +37,8 @@ jobs:
       # The download checks (checksum, unpacking) are plain Rust.
       - run: cargo test
 
+  # The artifact names in this file end in -ci: the release workflow runs
+  # this workflow too, and artifact names must be unique within one run.
   graphviz-wasm:
     name: Build graphviz.wasm
     runs-on: ubuntu-24.04
@@ -60,7 +62,7 @@ jobs:
           JOBS: 4
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: graphviz-wasm
+          name: graphviz-wasm-ci
           path: |
             server/graphviz-wasm/graphviz.wasm
             server/graphviz-wasm/graphviz.wasm.sha256
@@ -81,7 +83,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: graphviz-wasm
+          name: graphviz-wasm-ci
           path: server/graphviz-wasm
       - name: Install Rust
         run: |
@@ -113,7 +115,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: graphviz-wasm
+          name: graphviz-wasm-ci
           path: server/graphviz-wasm
       - name: Install Graphviz (Linux)
         if: runner.os == 'Linux'
