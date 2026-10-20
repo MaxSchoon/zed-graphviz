@@ -9,4 +9,7 @@ path = "src/dot.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+sha2 = "0.11"
+tar = { version = "0.4", default-features = false }
 zed_extension_api = "0.7.0"

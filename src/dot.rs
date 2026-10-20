@@ -1,3 +1,5 @@
+mod archive;
+
 use std::fs;
 use zed::settings::LspSettings;
 use zed_extension_api::{self as zed, serde_json, LanguageServerId, Result};
@@ -60,13 +62,9 @@ fn download_preview_server(language_server_id: &LanguageServerId) -> Result<Stri
             ))
         }
     };
-    let (archive_ext, file_type, binary_name) = match os {
-        zed::Os::Windows => ("zip", zed::DownloadedFileType::Zip, "graphviz-preview.exe"),
-        _ => (
-            "tar.gz",
-            zed::DownloadedFileType::GzipTar,
-            "graphviz-preview",
-        ),
+    let binary_name = match os {
+        zed::Os::Windows => "graphviz-preview.exe",
+        _ => "graphviz-preview",
     };
 
     let version = env!("CARGO_PKG_VERSION");
@@ -83,23 +81,34 @@ fn download_preview_server(language_server_id: &LanguageServerId) -> Result<Stri
     let tag = format!("v{version}");
     let release = zed::github_release_by_tag_name(PREVIEW_REPO, &tag)
         .map_err(|e| format!("could not find release {tag} of {PREVIEW_REPO}: {e}"))?;
-    let asset_name = format!("{PREVIEW_SERVER}-{target}.{archive_ext}");
-    let asset = release
-        .assets
-        .iter()
-        .find(|asset| asset.name == asset_name)
-        .ok_or_else(|| format!("release {tag} has no asset {asset_name}"))?;
+    let asset_name = format!("{PREVIEW_SERVER}-{target}.tar.gz");
+    let checksum_name = format!("{asset_name}.sha256");
+    let find = |name: &str| {
+        release
+            .assets
+            .iter()
+            .find(|asset| asset.name == name)
+            .ok_or_else(|| format!("release {tag} has no asset {name}"))
+    };
+    let (asset, checksum) = (find(&asset_name)?, find(&checksum_name)?);
 
     zed::set_language_server_installation_status(
         language_server_id,
         &zed::LanguageServerInstallationStatus::Downloading,
     );
-    if let Err(e) = zed::download_file(&asset.download_url, &version_dir, file_type) {
+    let installed = install_verified(
+        &asset.download_url,
+        &asset_name,
+        &checksum.download_url,
+        &version_dir,
+    );
+    if let Err(e) = installed {
+        fs::remove_dir_all(&version_dir).ok();
         zed::set_language_server_installation_status(
             language_server_id,
             &zed::LanguageServerInstallationStatus::Failed(e.clone()),
         );
-        return Err(format!("could not download {asset_name}: {e}"));
+        return Err(e);
     }
     zed::make_file_executable(&binary_path)?;
 
@@ -119,6 +128,43 @@ fn download_preview_server(language_server_id: &LanguageServerId) -> Result<Stri
         &zed::LanguageServerInstallationStatus::None,
     );
     Ok(binary_path)
+}
+
+/// Downloads the archive and its checksum, and unpacks the archive into
+/// `dir` only when the checksum matches.
+fn install_verified(
+    archive_url: &str,
+    archive_name: &str,
+    checksum_url: &str,
+    dir: &str,
+) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| format!("could not create {dir}: {e}"))?;
+    let archive_path = format!("{dir}/{archive_name}");
+    let checksum_path = format!("{archive_path}.sha256");
+    zed::download_file(
+        archive_url,
+        &archive_path,
+        zed::DownloadedFileType::Uncompressed,
+    )
+    .map_err(|e| format!("could not download {archive_name}: {e}"))?;
+    zed::download_file(
+        checksum_url,
+        &checksum_path,
+        zed::DownloadedFileType::Uncompressed,
+    )
+    .map_err(|e| format!("could not download {archive_name}.sha256: {e}"))?;
+    let checksum = fs::read_to_string(&checksum_path)
+        .map_err(|e| format!("could not read {checksum_path}: {e}"))?;
+    let expected = archive::parse_checksum(&checksum, archive_name)?;
+    let bytes =
+        fs::read(&archive_path).map_err(|e| format!("could not read {archive_path}: {e}"))?;
+    archive::verify_sha256(&bytes, &expected)
+        .map_err(|e| format!("refusing the downloaded {archive_name}: {e}"))?;
+    archive::unpack_tar_gz(&bytes, std::path::Path::new(dir))
+        .map_err(|e| format!("could not unpack {archive_name}: {e}"))?;
+    fs::remove_file(&archive_path).ok();
+    fs::remove_file(&checksum_path).ok();
+    Ok(())
 }
 
 fn server_settings(server: &str, worktree: &zed::Worktree) -> serde_json::Value {
