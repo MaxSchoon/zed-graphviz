@@ -24,6 +24,8 @@ pub struct Client {
     /// Params of every `window/showDocument` request, in order.
     pub show_documents: Arc<Mutex<Vec<Value>>>,
     pub stderr: Arc<Mutex<String>>,
+    /// What `workspace/configuration` answers, like Zed's current settings.
+    settings: Arc<Mutex<Value>>,
     next_id: i64,
     pub cache: tempfile::TempDir,
     pub workspace: tempfile::TempDir,
@@ -33,6 +35,8 @@ pub struct Options {
     pub settings: Value,
     /// Replaces PATH for the server process.
     pub path_env: Option<PathBuf>,
+    /// Extra environment variables for the server process.
+    pub env: Vec<(&'static str, String)>,
 }
 
 impl Default for Options {
@@ -40,6 +44,7 @@ impl Default for Options {
         Self {
             settings: json!({}),
             path_env: None,
+            env: Vec::new(),
         }
     }
 }
@@ -84,6 +89,9 @@ impl Client {
         if let Some(path) = &options.path_env {
             command.env("PATH", path);
         }
+        for (key, value) in &options.env {
+            command.env(key, value);
+        }
         let mut child = command.spawn().expect("spawn graphviz-preview");
         let stdin = Arc::new(Mutex::new(child.stdin.take().unwrap()));
         let stdout = child.stdout.take().unwrap();
@@ -102,11 +110,12 @@ impl Client {
         }
 
         let show_documents = Arc::new(Mutex::new(Vec::new()));
+        let settings = Arc::new(Mutex::new(options.settings.clone()));
         let (tx, incoming) = mpsc::channel();
         {
             let stdin = stdin.clone();
             let show_documents = show_documents.clone();
-            let settings = options.settings.clone();
+            let settings = settings.clone();
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(stdout);
                 while let Some(message) = read_message(&mut reader) {
@@ -135,7 +144,9 @@ impl Client {
                                 items
                                     .iter()
                                     .map(|item| match item["section"].as_str() {
-                                        Some("graphviz-preview") => settings.clone(),
+                                        Some("graphviz-preview") => {
+                                            settings.lock().unwrap().clone()
+                                        }
                                         _ => Value::Null,
                                     })
                                     .collect(),
@@ -158,6 +169,7 @@ impl Client {
             notifications: Vec::new(),
             show_documents,
             stderr,
+            settings,
             next_id: 0,
             cache,
             workspace,
@@ -178,6 +190,42 @@ impl Client {
         );
         client.notify("initialized", json!({}));
         client
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Changes the settings the way Zed does: the new value is pushed and
+    /// also returned by later `workspace/configuration` requests.
+    pub fn set_settings(&mut self, settings: Value) {
+        *self.settings.lock().unwrap() = settings.clone();
+        self.notify(
+            "workspace/didChangeConfiguration",
+            json!({"settings": {"graphviz-preview": settings}}),
+        );
+    }
+
+    pub fn close(&mut self, uri: &str) {
+        self.notify(
+            "textDocument/didClose",
+            json!({"textDocument": {"uri": uri}}),
+        );
+    }
+
+    /// Sends `shutdown` and `exit` and waits for the process to end.
+    pub fn exit(&mut self) {
+        self.request("shutdown", Value::Null);
+        self.notify("exit", Value::Null);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                assert!(status.success(), "server exited with {status}");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("server did not exit after shutdown/exit");
     }
 
     pub fn notify(&mut self, method: &str, params: Value) {
@@ -338,10 +386,31 @@ impl Image {
         ]
     }
 
+    /// Pixels that satisfy `pred`.
+    pub fn count(&self, pred: impl Fn([u8; 4]) -> bool) -> usize {
+        self.rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|&&p| pred(p))
+            .count()
+    }
+
+    /// Pixels that differ from the background (the top-left pixel) by more
+    /// than `by` in luma: the drawn nodes, edges and text.
+    pub fn drawn(&self, by: f32) -> usize {
+        let background = self.luma(0, 0);
+        self.count(|p| (luma(p) - background).abs() > by)
+    }
+
     pub fn luma(&self, x: u32, y: u32) -> f32 {
         let [r, g, b, _] = self.pixel(x, y);
         0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32
     }
+}
+
+pub fn luma([r, g, b, _]: [u8; 4]) -> f32 {
+    0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32
 }
 
 /// Decodes a PNG with the `png` crate (independent of the encoder used by

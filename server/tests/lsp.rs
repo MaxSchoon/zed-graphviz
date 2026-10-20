@@ -46,6 +46,13 @@ fn r1_open_shows_one_png_document() {
     );
     let image = decode_png(&std::fs::read(&path).unwrap());
     assert!(image.width > 10 && image.height > 10);
+    // Three labelled nodes and two edges, not an empty canvas.
+    let drawn = image.drawn(60.0);
+    let total = (image.width * image.height) as usize;
+    assert!(
+        drawn > 500 && drawn < total / 2,
+        "drawn pixels: {drawn} of {total}"
+    );
     client.shutdown();
 }
 
@@ -87,6 +94,10 @@ fn r2_live_change_rewrites_png_without_new_show_document() {
     );
     let image = decode_png(&after);
     let old = decode_png(&before);
+    assert!(
+        image.drawn(60.0) > old.drawn(60.0),
+        "the new nodes were not drawn"
+    );
     assert!(
         image.height > old.height,
         "the longer graph should be taller"
@@ -170,7 +181,7 @@ fn r4_dot_renderer() {
     let uri = client.open("flow.dot", SAMPLE);
     client.command("graphviz.openPreview", &uri);
     let path = path_of(&client.show_document_uris()[0]);
-    decode_png(&std::fs::read(path).unwrap());
+    assert!(decode_png(&std::fs::read(path).unwrap()).drawn(60.0) > 500);
     let log = client.log();
     assert!(log.contains("renderer: engine=dot"), "{log}");
     assert!(log.contains("render: engine=dot"), "{log}");
@@ -188,12 +199,13 @@ fn r4_bundled_renderer_without_dot_on_path() {
     let mut client = Client::start(Options {
         settings: json!({"renderer": "bundled", "timeout_ms": 120000}),
         path_env: Some(empty.path().to_path_buf()),
+        ..Options::default()
     });
     let uri = client.open("flow.dot", SAMPLE);
     client.command("graphviz.openPreview", &uri);
     let uris = client.show_document_uris();
     assert_eq!(uris.len(), 1, "log:\n{}", client.log());
-    decode_png(&std::fs::read(path_of(&uris[0])).unwrap());
+    assert!(decode_png(&std::fs::read(path_of(&uris[0])).unwrap()).drawn(60.0) > 500);
 
     client.command("graphviz.exportSvg", &uri);
     let svg_path = client.workspace.path().join("flow.svg");
@@ -338,6 +350,7 @@ fn r6_hover_on_the_header_returns_a_thumbnail() {
         .expect("valid base64");
     let image = decode_png(&png);
     assert!(image.width <= 480, "thumbnail too wide: {}", image.width);
+    assert!(image.drawn(60.0) > 200, "the thumbnail shows no graph");
     assert!(value.contains("Open Graphviz preview"));
 
     // Not on the header: nothing.
@@ -379,6 +392,9 @@ fn r7_exports_are_valid_and_light_even_in_dark_mode() {
         "export background is not light: {:?}",
         image.pixel(0, 0)
     );
+    // Graphviz's default black lines and text on that background.
+    let dark_ink = image.count(|p| common::luma(p) < 100.0);
+    assert!(dark_ink > 500, "no dark strokes: {dark_ink}");
 
     let messages: Vec<String> = client.notifications[since..]
         .iter()
@@ -417,6 +433,14 @@ fn r8_dark_appearance_and_file_colours() {
         image.pixel(0, 0)
     );
     assert_eq!(image.pixel(0, 0)[3], 255);
+    // Light lines and text on the dark background.
+    let light_ink = image.count(|p| common::luma(p) > 150.0);
+    assert!(light_ink > 500, "no light strokes: {light_ink}");
+    assert_eq!(
+        image.count(|p| common::luma(p) < 30.0),
+        0,
+        "black ink on dark"
+    );
 
     let white = SAMPLE.replace("digraph flow {", "digraph flow {\n  bgcolor=white;");
     let uri = client.open("white.dot", &white);
@@ -428,6 +452,10 @@ fn r8_dark_appearance_and_file_colours() {
         image.pixel(0, 0),
         [255, 255, 255, 255],
         "the file's bgcolor must win"
+    );
+    assert!(
+        image.drawn(30.0) > 500,
+        "nothing drawn on the white background"
     );
     client.shutdown();
 }
@@ -519,9 +547,15 @@ fn render_timeout_stops_graphviz_and_reports_it() {
 
 /// A graph that makes Graphviz recurse deeply (and takes it many seconds).
 fn dense_graph() -> String {
+    dense(400)
+}
+
+/// `n` nodes, each linked to the next eleven: dot needs about a second for
+/// 120 nodes, a few for 200 and over ten for 400.
+fn dense(n: usize) -> String {
     let mut text = String::from("digraph big {\n");
-    for i in 0..400 {
-        for j in (i + 1)..(i + 12).min(400) {
+    for i in 0..n {
+        for j in (i + 1)..(i + 12).min(n) {
             text.push_str(&format!("  n{i} -> n{j};\n"));
         }
     }
@@ -539,6 +573,7 @@ fn bundled_graphviz_has_the_stack_for_deep_recursion_and_is_bounded() {
     let mut client = Client::start(Options {
         settings: json!({"renderer": "bundled", "timeout_ms": 4000}),
         path_env: Some(empty.path().to_path_buf()),
+        ..Options::default()
     });
     let uri = client.open("big.dot", &dense_graph());
     let note = client
@@ -556,5 +591,252 @@ fn bundled_graphviz_has_the_stack_for_deep_recursion_and_is_bounded() {
         message.contains("did not finish within 4000 ms"),
         "{message}"
     );
+    client.shutdown();
+}
+
+#[test]
+fn output_over_the_cap_is_a_diagnostic_and_keeps_the_png() {
+    let mut client = Client::start(Options {
+        settings: json!({"debounce_ms": 50}),
+        env: vec![("GRAPHVIZ_PREVIEW_MAX_SVG_BYTES", "20000".to_string())],
+        ..Options::default()
+    });
+    let uri = client.open("flow.dot", SAMPLE);
+    client.command("graphviz.openPreview", &uri);
+    let path = path_of(&client.show_document_uris()[0]);
+    let good = std::fs::read(&path).unwrap();
+
+    // Two hundred labelled nodes make far more than 20000 bytes of SVG.
+    let mut big = String::from("digraph flow {\n");
+    for i in 0..200 {
+        big.push_str(&format!("  n{i} [label=\"node number {i}\"];\n"));
+    }
+    big.push_str("}\n");
+    let since = client.notifications.len();
+    client.change(&uri, 2, &big);
+    let note = client
+        .wait_notification(since, Duration::from_secs(10), |n| {
+            diagnostics_for(&uri)(n)
+                && n["params"]["diagnostics"]
+                    .as_array()
+                    .is_some_and(|d| !d.is_empty())
+        })
+        .unwrap_or_else(|| panic!("no diagnostic; log:\n{}", client.log()));
+    let message = note["params"]["diagnostics"][0]["message"]
+        .as_str()
+        .unwrap();
+    assert!(
+        message.contains("Graphviz wrote more than 19 KiB of SVG"),
+        "{message}"
+    );
+    client.pump(Duration::from_millis(200));
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        good,
+        "the last good PNG must stay"
+    );
+    client.shutdown();
+}
+
+/// Process ids of the children of `parent`, from `ps`.
+#[cfg(unix)]
+fn children_of(parent: u32) -> Vec<u32> {
+    let out = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=", "-o", "ppid="])
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid: u32 = fields.next()?.parse().ok()?;
+            (ppid == parent).then_some(pid)
+        })
+        .collect()
+}
+
+/// Whether `pid` is a live (not zombie) process.
+#[cfg(unix)]
+fn running(pid: u32) -> bool {
+    let out = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+        .expect("ps");
+    let stat = String::from_utf8_lossy(&out.stdout);
+    let stat = stat.trim();
+    !stat.is_empty() && !stat.starts_with('Z')
+}
+
+#[cfg(unix)]
+#[test]
+fn exit_stops_a_running_dot() {
+    let mut client = Client::start(Options {
+        settings: json!({"renderer": "dot", "timeout_ms": 120000}),
+        ..Options::default()
+    });
+    // dot needs well over ten seconds for this graph.
+    client.open("big.dot", &dense_graph());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let dot = loop {
+        if let Some(&pid) = children_of(client.pid()).first() {
+            break pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "dot never started; log:\n{}",
+            client.log()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(running(dot));
+    client.exit();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while running(dot) {
+        assert!(
+            Instant::now() < deadline,
+            "dot (pid {dot}) outlived the server; log:\n{}",
+            client.log()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_render_from_before_a_reopen_is_not_applied() {
+    // A small scale keeps drawing cheap; dot's layout is what is slow.
+    let mut client = Client::start(Options {
+        settings: json!({"renderer": "dot", "debounce_ms": 50, "scale": 0.25}),
+        ..Options::default()
+    });
+    let uri = client.open("flow.dot", SAMPLE);
+    client.command("graphviz.openPreview", &uri);
+    let path = path_of(&client.show_document_uris()[0]);
+
+    // Start a slow live render, then close and reopen the file with other
+    // text while it runs.
+    client.change(&uri, 2, &dense(150));
+    client.pump(Duration::from_millis(300));
+    client.close(&uri);
+    let reopened = client.open("flow.dot", "digraph flow { reopened }\n");
+    assert_eq!(reopened, uri);
+    client.command("graphviz.openPreview", &uri);
+    let after_reopen = std::fs::read(&path).unwrap();
+
+    // Let the slow render finish; its result belongs to the closed document.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !client.log().contains("kind=live") {
+        assert!(
+            Instant::now() < deadline,
+            "the slow render never finished; log:\n{}",
+            client.log()
+        );
+        client.pump(Duration::from_millis(50));
+    }
+    client.pump(Duration::from_millis(200));
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        after_reopen,
+        "a result from before the reopen replaced the preview; log:\n{}",
+        client.log()
+    );
+    client.shutdown();
+}
+
+#[test]
+fn back_to_back_settings_changes_end_on_the_latest() {
+    // Drawing at 0.75 takes much longer than at 0.25, so without revision
+    // checks the first, outdated render would finish last and win.
+    let settings = |scale: f64| json!({"renderer": "dot", "scale": scale, "appearance": "light"});
+    let mut client = Client::start(Options {
+        settings: settings(0.25),
+        ..Options::default()
+    });
+    let uri = client.open("dense.dot", &dense(120));
+    client.command("graphviz.openPreview", &uri);
+    let path = path_of(&client.show_document_uris()[0]);
+    let width = decode_png(&std::fs::read(&path).unwrap()).width;
+
+    let renders_before = client.log().matches("kind=live").count();
+    client.set_settings(settings(0.75));
+    client.set_settings(settings(0.25));
+    // Wait for both re-renders (or the skip of the first) to settle.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let log = client.log();
+        let settled =
+            log.matches("kind=live").count() + log.matches("skipped superseded live").count();
+        if settled >= renders_before + 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "renders did not settle; log:\n{log}"
+        );
+        client.pump(Duration::from_millis(50));
+    }
+    client.pump(Duration::from_millis(300));
+    let image = decode_png(&std::fs::read(&path).unwrap());
+    assert_eq!(
+        image.width, width,
+        "the preview does not reflect the latest settings"
+    );
+    client.shutdown();
+}
+
+#[test]
+fn images_outside_the_workspace_are_not_drawn() {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let image = elsewhere.path().join("secret.png");
+    // A 20x20 opaque red PNG.
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, 20, 20);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer
+            .write_image_data(&[255, 0, 0, 255].repeat(400))
+            .unwrap();
+    }
+    std::fs::write(&image, &png_bytes).unwrap();
+
+    let mut client = Client::start(Options {
+        settings: json!({"renderer": "dot", "appearance": "light"}),
+        ..Options::default()
+    });
+    let text = format!(
+        "digraph g {{\n  a [shape=box label=\"\" image=\"{}\"];\n}}\n",
+        image.display()
+    );
+    let since = client.notifications.len();
+    let uri = client.open("img.dot", &text);
+    client.command("graphviz.openPreview", &uri);
+    let note = client
+        .wait_notification(since, Duration::from_secs(10), |n| {
+            diagnostics_for(&uri)(n)
+                && n["params"]["diagnostics"].as_array().is_some_and(|d| {
+                    d.iter()
+                        .any(|d| d["message"].as_str().unwrap_or("").contains("outside"))
+                })
+        })
+        .unwrap_or_else(|| panic!("no warning; log:\n{}", client.log()));
+    let warning = note["params"]["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["message"].as_str().unwrap().contains("outside"))
+        .unwrap()
+        .clone();
+    assert_eq!(warning["severity"], 2);
+    let shown = decode_png(&std::fs::read(path_of(&client.show_document_uris()[0])).unwrap());
+    let red = (0..shown.height)
+        .flat_map(|y| (0..shown.width).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let [r, g, b, _] = shown.pixel(x, y);
+            r > 200 && g < 60 && b < 60
+        })
+        .count();
+    assert_eq!(red, 0, "the outside image was drawn");
     client.shutdown();
 }

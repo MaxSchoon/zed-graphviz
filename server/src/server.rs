@@ -106,13 +106,14 @@ struct Doc {
     uri: Uri,
     text: Arc<String>,
     version: i32,
-    /// Bumped on every change; shared with workers so queued live renders
-    /// of outdated text can be skipped.
-    gen: Arc<AtomicU64>,
-    /// Generation of the preview image on disk.
-    applied_gen: u64,
-    /// Generation of the last published diagnostics.
-    diag_gen: u64,
+    /// Identifies this open/close lifetime of the document, so results of a
+    /// render started before a close and reopen are never applied.
+    lifetime: u64,
+    /// The render revision: advances whenever an input of the render
+    /// changes (the text, the settings, the light/dark appearance). Only a
+    /// result for the latest revision is applied. Shared with workers so
+    /// queued live renders of outdated input are skipped.
+    rev: Arc<AtomicU64>,
     /// Shared with workers: a diagnostics-only check is redundant once the
     /// preview renders the document anyway.
     preview_open: Arc<AtomicBool>,
@@ -167,7 +168,8 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 
 struct Job {
     key: String,
-    gen: u64,
+    lifetime: u64,
+    rev: u64,
     latest: Arc<AtomicU64>,
     preview_open: Arc<AtomicBool>,
     version: i32,
@@ -180,13 +182,13 @@ struct Job {
     timeout: Duration,
     /// `(scale, max width)` when a PNG is wanted.
     png: Option<(f32, Option<f32>)>,
-    resources_dir: Option<PathBuf>,
+    images: render::ImagePolicy,
     preview_path: Option<PathBuf>,
 }
 
 struct Outcome {
     svg: Option<Vec<u8>>,
-    png: Option<Result<Vec<u8>, String>>,
+    png: Option<Result<render::Raster, String>>,
     stderr: String,
     timed_out: bool,
     failure: Option<String>,
@@ -220,7 +222,9 @@ struct Server {
     debounce: HashMap<String, Instant>,
     outgoing: HashMap<RequestId, Outgoing>,
     next_request: i32,
-    jobs: Sender<Job>,
+    /// `None` once the server is stopping.
+    jobs: Option<Sender<Job>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
     events: Receiver<Event>,
     event_tx: Sender<Event>,
     watching_appearance: bool,
@@ -229,12 +233,17 @@ struct Server {
     client_pulls_configuration: bool,
     client_shows_documents: bool,
     shutting_down: bool,
+    next_lifetime: u64,
+    /// Workspace folders; images in a document must come from the folder
+    /// that holds it.
+    workspace_roots: Vec<PathBuf>,
 }
 
 impl Server {
     fn new(sender: Sender<Message>, params: &InitializeParams) -> Self {
         let (jobs, job_rx) = unbounded::<Job>();
         let (event_tx, events) = unbounded::<Event>();
+        let mut workers = Vec::new();
         for i in 0..WORKERS {
             let job_rx = job_rx.clone();
             let event_tx = event_tx.clone();
@@ -259,10 +268,17 @@ impl Server {
                         }
                     }
                 });
-            if let Err(e) = spawned {
-                log(format!("could not start render worker {i}: {e}"));
+            match spawned {
+                Ok(handle) => workers.push(handle),
+                Err(e) => log(format!("could not start render worker {i}: {e}")),
             }
         }
+        let workspace_roots: Vec<PathBuf> = params
+            .workspace_folders
+            .iter()
+            .flatten()
+            .filter_map(|folder| file_path(&folder.uri))
+            .collect();
 
         let caps = &params.capabilities;
         let client_pulls_configuration = caps
@@ -290,7 +306,8 @@ impl Server {
             debounce: HashMap::new(),
             outgoing: HashMap::new(),
             next_request: 0,
-            jobs,
+            jobs: Some(jobs),
+            workers,
             events,
             event_tx,
             watching_appearance: false,
@@ -299,6 +316,8 @@ impl Server {
             client_pulls_configuration,
             client_shows_documents,
             shutting_down: false,
+            next_lifetime: 0,
+            workspace_roots,
         };
         let (settings, warnings) = Settings::from_json(
             params
@@ -334,6 +353,7 @@ impl Server {
                     Ok(Message::Notification(n)) => {
                         if n.method == notif::Exit::METHOD {
                             log("exit");
+                            self.stop_rendering();
                             return;
                         }
                         self.on_notification(n);
@@ -341,6 +361,7 @@ impl Server {
                     Ok(Message::Response(response)) => self.on_response(response),
                     Err(_) => {
                         log("client connection closed");
+                        self.stop_rendering();
                         return;
                     }
                 },
@@ -353,6 +374,21 @@ impl Server {
             }
             self.fire_debounced();
         }
+    }
+
+    /// Kills running `dot` processes, interrupts the bundled Graphviz and
+    /// waits for the render threads, so nothing outlives the server.
+    fn stop_rendering(&mut self) {
+        let children = render::running_children();
+        if !children.is_empty() {
+            log(format!("stopping dot processes {children:?}"));
+        }
+        render::cancel_all();
+        self.jobs = None;
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+        log("render threads stopped");
     }
 
     // ---- messages to the client -------------------------------------------------
@@ -457,9 +493,17 @@ impl Server {
             self.debounce.clear();
         }
         if looks_changed {
+            self.bump_all_revisions();
             self.rerender_previews();
         }
         self.watch_appearance();
+    }
+
+    /// Marks every document's render input as changed.
+    fn bump_all_revisions(&mut self) {
+        for doc in self.docs.values() {
+            doc.rev.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     fn rerender_previews(&mut self) {
@@ -508,6 +552,7 @@ impl Server {
             req::Shutdown::METHOD => {
                 self.shutting_down = true;
                 log("shutdown");
+                render::cancel_all();
                 self.respond(id, Value::Null);
             }
             req::HoverRequest::METHOD => match serde_json::from_value::<HoverParams>(params) {
@@ -625,15 +670,15 @@ impl Server {
         let key = uri.as_str().to_string();
         let source_path = file_path(&uri);
         let preview_path = self.preview_path_for(&key, source_path.as_deref());
+        self.next_lifetime += 1;
         self.docs.insert(
             key.clone(),
             Doc {
                 uri,
                 text: Arc::new(p.text_document.text),
                 version: p.text_document.version,
-                gen: Arc::new(AtomicU64::new(1)),
-                applied_gen: 0,
-                diag_gen: 0,
+                lifetime: self.next_lifetime,
+                rev: Arc::new(AtomicU64::new(1)),
                 preview_open: Arc::new(AtomicBool::new(false)),
                 source_path,
                 preview_path,
@@ -653,7 +698,11 @@ impl Server {
         };
         doc.text = Arc::new(change.text);
         doc.version = p.text_document.version;
-        doc.gen.fetch_add(1, Ordering::SeqCst);
+        // With `render: "save"` the preview shows the saved text, so typing
+        // is not a new render input until the save.
+        if self.settings.render == RenderMode::Live {
+            doc.rev.fetch_add(1, Ordering::SeqCst);
+        }
         if doc.preview_open.load(Ordering::Relaxed) && self.settings.render == RenderMode::Live {
             let deadline = Instant::now() + Duration::from_millis(self.settings.debounce_ms);
             self.debounce.insert(key, deadline);
@@ -665,6 +714,9 @@ impl Server {
         let Some(doc) = self.docs.get(&key) else {
             return;
         };
+        if self.settings.render == RenderMode::Save {
+            doc.rev.fetch_add(1, Ordering::SeqCst);
+        }
         let kind = if doc.preview_open.load(Ordering::Relaxed) {
             JobKind::Save
         } else {
@@ -813,15 +865,15 @@ impl Server {
             return false;
         };
         let preview_path = self.preview_path_for(key, Some(&path));
+        self.next_lifetime += 1;
         self.docs.insert(
             key.to_string(),
             Doc {
                 uri,
                 text: Arc::new(text),
                 version: 0,
-                gen: Arc::new(AtomicU64::new(1)),
-                applied_gen: 0,
-                diag_gen: 0,
+                lifetime: self.next_lifetime,
+                rev: Arc::new(AtomicU64::new(1)),
                 preview_open: Arc::new(AtomicBool::new(false)),
                 source_path: Some(path),
                 preview_path,
@@ -903,8 +955,9 @@ impl Server {
         };
         let job = Job {
             key: key.to_string(),
-            gen: doc.gen.load(Ordering::SeqCst),
-            latest: doc.gen.clone(),
+            lifetime: doc.lifetime,
+            rev: doc.rev.load(Ordering::SeqCst),
+            latest: doc.rev.clone(),
             preview_open: doc.preview_open.clone(),
             version: doc.version,
             text: doc.text.clone(),
@@ -914,14 +967,15 @@ impl Server {
             dark,
             timeout: Duration::from_millis(self.settings.timeout_ms),
             png,
-            resources_dir: doc
-                .source_path
-                .as_ref()
-                .and_then(|p| p.parent().map(Path::to_path_buf)),
+            images: self.image_policy(doc.source_path.as_deref()),
             preview_path: doc.preview_path.clone(),
         };
-        if let Err(e) = self.jobs.send(job) {
-            if let Some(id) = e.0.kind.request_id() {
+        let sent = match &self.jobs {
+            Some(jobs) => jobs.send(job).map_err(|e| e.0),
+            None => Err(job),
+        };
+        if let Err(job) = sent {
+            if let Some(id) = job.kind.request_id() {
                 self.respond_err(
                     id,
                     ErrorCode::InternalError,
@@ -931,6 +985,23 @@ impl Server {
                 log("render queue closed: the render workers have stopped");
             }
         }
+    }
+
+    /// Images may come from the workspace folder holding the document, or
+    /// from the document's own folder when it is in none.
+    fn image_policy(&self, source: Option<&Path>) -> render::ImagePolicy {
+        let Some(source) = source else {
+            return render::ImagePolicy::default();
+        };
+        let base = source.parent().map(Path::to_path_buf);
+        let root = self
+            .workspace_roots
+            .iter()
+            .filter(|root| source.starts_with(root))
+            .max_by_key(|root| root.as_os_str().len())
+            .cloned()
+            .or_else(|| base.clone());
+        render::ImagePolicy { base, root }
     }
 
     fn publish(&self, uri: Uri, version: i32, diagnostics: Vec<Diagnostic>) {
@@ -946,10 +1017,10 @@ impl Server {
             Event::Done(job, outcome) => (job, outcome),
             Event::Skipped(job) => {
                 log(format!(
-                    "render: skipped superseded {} render of {} (gen {})",
+                    "render: skipped superseded {} render of {} (rev {})",
                     job_label(&job.kind),
                     job.key,
-                    job.gen
+                    job.rev
                 ));
                 return;
             }
@@ -974,6 +1045,7 @@ impl Server {
                         "appearance: the OS switched to {}; re-rendering open previews",
                         if dark { "dark" } else { "light" }
                     ));
+                    self.bump_all_revisions();
                     self.rerender_previews();
                 }
                 return;
@@ -982,10 +1054,10 @@ impl Server {
         let label = job_label(&job.kind);
         let svg_bytes = outcome.svg.as_ref().map_or(0, Vec::len);
         log(format!(
-            "render: engine={} layout={} kind={label} gen={} svg {} ms ({svg_bytes} bytes), png {} ms{}",
+            "render: engine={} layout={} kind={label} rev={} svg {} ms ({svg_bytes} bytes), png {} ms{}",
             job.renderer.name(),
             self.settings.engine.as_deref().unwrap_or("file"),
-            job.gen,
+            job.rev,
             outcome.svg_ms,
             outcome.png_ms,
             if outcome.timed_out { ", timed out" } else { "" },
@@ -999,10 +1071,24 @@ impl Server {
 
         match &job.kind {
             JobKind::Live | JobKind::Save | JobKind::Check | JobKind::Open(_) => {
-                self.publish_if_current(&job, problems);
-                self.apply_preview(&job, &outcome);
+                let current = self.is_current(&job);
+                let uri = self.docs.get(&job.key).map(|doc| doc.uri.clone());
+                if let (true, Some(uri)) = (current, uri) {
+                    self.publish(uri, job.version, problems);
+                    self.apply_preview(&job, &outcome);
+                } else {
+                    log(format!(
+                        "render: dropped {label} result for {} (rev {}): its input has changed",
+                        job.key, job.rev
+                    ));
+                }
                 if let JobKind::Open(id) = &job.kind {
-                    self.finish_open(id.clone(), &job, rendered);
+                    if !current && self.docs.contains_key(&job.key) {
+                        // Render the latest input before showing the preview.
+                        self.queue(&job.key, JobKind::Open(id.clone()));
+                    } else {
+                        self.finish_open(id.clone(), &job, rendered);
+                    }
                 }
             }
             JobKind::Hover(id, hash) => {
@@ -1042,7 +1128,7 @@ impl Server {
             ));
         }
         if let Some(failure) = &outcome.failure {
-            extra(format!("Graphviz could not run: {failure}"));
+            extra(failure.clone());
         }
         if let Some(Err(e)) = &outcome.png {
             extra(format!(
@@ -1056,41 +1142,38 @@ impl Server {
         {
             extra("Graphviz failed without an error message.".into());
         }
+        if let Some(Ok(raster)) = &outcome.png {
+            for href in &raster.refused_images {
+                problems.push(diagnostics::header_diagnostic(
+                    &job.text,
+                    DiagnosticSeverity::WARNING,
+                    format!(
+                        "The image {href} is outside this document's workspace folder and is not drawn in the preview."
+                    ),
+                ));
+            }
+        }
         problems
     }
 
-    fn publish_if_current(&mut self, job: &Job, problems: Vec<Diagnostic>) {
-        let Some(doc) = self.docs.get_mut(&job.key) else {
-            return;
-        };
-        if job.gen < doc.diag_gen {
-            return;
-        }
-        doc.diag_gen = job.gen;
-        let uri = doc.uri.clone();
-        self.publish(uri, job.version, problems);
+    /// Whether `job` rendered the latest input of the open document.
+    fn is_current(&self, job: &Job) -> bool {
+        self.docs.get(&job.key).is_some_and(|doc| {
+            doc.lifetime == job.lifetime && doc.rev.load(Ordering::SeqCst) == job.rev
+        })
     }
 
+    /// Writes the preview of a current result.
     fn apply_preview(&mut self, job: &Job, outcome: &Outcome) {
-        let Some(Ok(png)) = &outcome.png else {
+        let Some(Ok(raster)) = &outcome.png else {
             return;
         };
-        let Some(doc) = self.docs.get_mut(&job.key) else {
-            return;
-        };
-        if job.gen < doc.applied_gen {
-            log(format!(
-                "render: dropped stale render of {} (gen {} < {})",
-                job.key, job.gen, doc.applied_gen
-            ));
-            return;
-        }
+        let png = &raster.png;
         let Some(path) = job.preview_path.as_ref() else {
             return;
         };
         match cache::write_atomic(path, png, cache::Access::Private) {
             Ok(()) => {
-                doc.applied_gen = job.gen;
                 log(format!(
                     "preview: wrote {} bytes to {}",
                     png.len(),
@@ -1155,7 +1238,7 @@ impl Server {
         let bytes = match format {
             ExportFormat::Svg => outcome.svg.as_deref(),
             ExportFormat::Png => match &outcome.png {
-                Some(Ok(png)) => Some(png.as_slice()),
+                Some(Ok(raster)) => Some(raster.png.as_slice()),
                 _ => None,
             },
         };
@@ -1213,8 +1296,8 @@ fn file_path(uri: &Uri) -> Option<PathBuf> {
 
 fn hover_markdown(outcome: &Outcome, problems: &[Diagnostic]) -> String {
     match &outcome.png {
-        Some(Ok(png)) => {
-            let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+        Some(Ok(raster)) => {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&raster.png);
             if encoded.len() > HOVER_MAX_BYTES {
                 format!("This graph is too large for a hover thumbnail.\n\n{HOVER_HINT}")
             } else {
@@ -1253,7 +1336,7 @@ fn hover_value(markdown: &str, line: u32, text: &str) -> Value {
 fn work(job: Job) -> Event {
     let superseded = match job.kind {
         // A newer live render is already scheduled.
-        JobKind::Live => job.latest.load(Ordering::SeqCst) > job.gen,
+        JobKind::Live => job.latest.load(Ordering::SeqCst) > job.rev,
         // The preview render reports the same diagnostics.
         JobKind::Check => job.preview_open.load(Ordering::Relaxed),
         _ => false,
@@ -1268,26 +1351,39 @@ fn work(job: Job) -> Event {
         None
     };
     let source = dark_source.as_deref().unwrap_or(&job.text);
-    let out = render::render_svg(&job.renderer, source, &job.args, job.timeout);
+    // One deadline covers every stage: Graphviz, parsing, drawing, encoding.
+    let deadline = render::Deadline::after(job.timeout);
+    let out = render::render_svg(&job.renderer, source, &job.args, deadline);
     let svg_ms = started.elapsed().as_millis();
     let started = Instant::now();
+    let mut timed_out = out.timed_out;
     let png = match (&out.svg, job.png) {
-        (Some(svg), Some((scale, max_width))) => Some(render::svg_to_png(
-            svg,
-            scale,
-            max_width,
-            job.resources_dir.as_deref(),
-        )),
+        (Some(svg), Some((scale, max_width))) => {
+            match render::svg_to_png(svg, scale, max_width, &job.images, deadline) {
+                Ok(raster) => Some(Ok(raster)),
+                Err(render::RasterError::TimedOut) => {
+                    timed_out = true;
+                    None
+                }
+                Err(render::RasterError::Failed(e)) => Some(Err(e)),
+            }
+        }
         _ => None,
     };
     let png_ms = started.elapsed().as_millis();
+    // A preview that ran out of time has no image, whatever Graphviz did.
+    let svg = if timed_out && job.png.is_some() {
+        None
+    } else {
+        out.svg
+    };
     Event::Done(
         job,
         Outcome {
-            svg: out.svg,
+            svg,
             png,
             stderr: out.stderr,
-            timed_out: out.timed_out,
+            timed_out,
             failure: out.failure,
             svg_ms,
             png_ms,

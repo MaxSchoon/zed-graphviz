@@ -8,9 +8,9 @@
 //! time, so the server only needs wasmtime's runtime to load it.
 
 use crate::engine_config;
-use crate::render::SvgOutput;
+use crate::render::{self, Deadline, SvgOutput};
 use std::sync::{mpsc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use wasmtime::{Config, Engine, InstancePre, Linker, Module, ResourceLimiter, Store, Trap};
 use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
@@ -21,9 +21,6 @@ static COMPILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/graphviz.cwas
 
 /// Linear memory a single render may use.
 pub const MAX_MEMORY: usize = 1 << 30;
-/// Largest SVG we accept on stdout.
-const MAX_STDOUT: usize = 256 << 20;
-const MAX_STDERR: usize = 1 << 20;
 
 /// The SHA-256 of the embedded `graphviz.wasm`, as hex.
 pub fn wasm_sha256() -> &'static str {
@@ -74,8 +71,9 @@ struct Bundled {
     lock: Mutex<()>,
 }
 
+static INSTANCE: OnceLock<Result<Bundled, String>> = OnceLock::new();
+
 fn instance() -> Result<&'static Bundled, String> {
-    static INSTANCE: OnceLock<Result<Bundled, String>> = OnceLock::new();
     INSTANCE
         .get_or_init(|| {
             load().map_err(|e| {
@@ -113,19 +111,27 @@ fn load() -> wasmtime::Result<Bundled> {
     })
 }
 
+/// Interrupts the render in progress, if any (used at shutdown; later
+/// renders see the cancellation before they start).
+pub fn interrupt() {
+    if let Some(Ok(bundled)) = INSTANCE.get() {
+        bundled.engine.increment_epoch();
+    }
+}
+
 /// Loads the module ahead of the first render.
 pub fn warm_up() {
     let _ = instance();
 }
 
-pub fn run(source: &str, args: &[String], timeout: Duration) -> SvgOutput {
-    run_with_memory(source, args, timeout, MAX_MEMORY)
+pub fn run(source: &str, args: &[String], deadline: Deadline) -> SvgOutput {
+    run_with_memory(source, args, deadline, MAX_MEMORY)
 }
 
 fn run_with_memory(
     source: &str,
     args: &[String],
-    timeout: Duration,
+    deadline: Deadline,
     max_memory: usize,
 ) -> SvgOutput {
     let failed = |msg: String| SvgOutput {
@@ -143,8 +149,9 @@ fn run_with_memory(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    let stdout = MemoryOutputPipe::new(MAX_STDOUT);
-    let stderr = MemoryOutputPipe::new(MAX_STDERR);
+    let max_svg = render::max_svg_bytes();
+    let stdout = MemoryOutputPipe::new(max_svg);
+    let stderr = MemoryOutputPipe::new(render::MAX_STDERR_BYTES);
     let mut builder = WasiCtxBuilder::new();
     builder
         .stdin(MemoryInputPipe::new(source.as_bytes().to_vec()))
@@ -167,6 +174,7 @@ fn run_with_memory(
     // stops the timer.
     let (done, wait) = mpsc::channel::<()>();
     let engine = bundled.engine.clone();
+    let timeout = deadline.remaining();
     let timer = std::thread::spawn(move || {
         if let Err(mpsc::RecvTimeoutError::Timeout) = wait.recv_timeout(timeout) {
             engine.increment_epoch();
@@ -186,13 +194,31 @@ fn run_with_memory(
     drop(store);
 
     let stdout = stdout.contents().to_vec();
-    let stderr = String::from_utf8_lossy(&stderr.contents()).into_owned();
+    let stderr_bytes = stderr.contents();
+    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+    // A full pipe refuses further writes, which Graphviz reports as an error.
+    if stdout.len() >= max_svg || stderr_bytes.len() >= render::MAX_STDERR_BYTES {
+        return SvgOutput {
+            svg: None,
+            stderr,
+            timed_out: false,
+            failure: Some(render::too_much_output()),
+        };
+    }
     let exit = match result {
         Ok(()) => 0,
         Err(e) => match e.downcast_ref::<I32Exit>() {
             Some(exit) => exit.0,
             None => {
-                let interrupted = timed_out && e.downcast_ref::<Trap>() == Some(&Trap::Interrupt);
+                let interrupted = e.downcast_ref::<Trap>() == Some(&Trap::Interrupt);
+                if interrupted && !timed_out {
+                    return SvgOutput {
+                        svg: None,
+                        stderr,
+                        timed_out: false,
+                        failure: Some("The render was cancelled.".into()),
+                    };
+                }
                 if interrupted {
                     crate::log(format!(
                         "bundled Graphviz: stopped after {} ms",
@@ -230,7 +256,7 @@ fn run_with_memory(
 
 fn memory_message(max_memory: usize) -> String {
     format!(
-        "the built-in Graphviz needs more than {} MiB of memory for this graph and was stopped",
+        "The built-in Graphviz needs more than {} MiB of memory for this graph and was stopped.",
         max_memory >> 20
     )
 }
@@ -242,24 +268,25 @@ fn failure_message(error: &wasmtime::Error, memory_hit: bool, max_memory: usize)
     }
     match error.downcast_ref::<Trap>() {
         Some(Trap::StackOverflow) => {
-            "the built-in Graphviz ran out of stack space on this graph; the system dot may still render it"
+            "The built-in Graphviz ran out of stack space on this graph; the system dot may still render it."
                 .to_string()
         }
         Some(Trap::MemoryOutOfBounds) => {
-            "the built-in Graphviz crashed (out-of-bounds memory access); the system dot may still render this graph"
+            "The built-in Graphviz crashed (out-of-bounds memory access); the system dot may still render this graph."
                 .to_string()
         }
         Some(Trap::UnreachableCodeReached) => {
-            "the built-in Graphviz stopped on an internal error".to_string()
+            "The built-in Graphviz stopped on an internal error.".to_string()
         }
-        Some(trap) => format!("the built-in Graphviz crashed: {trap}"),
-        None => format!("the built-in Graphviz failed: {}", error.root_cause()),
+        Some(trap) => format!("The built-in Graphviz crashed: {trap}."),
+        None => format!("The built-in Graphviz failed: {}.", error.root_cause()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const SAMPLE: &str = "digraph { alpha -> beta }";
 
@@ -279,7 +306,8 @@ mod tests {
 
     #[test]
     fn precompiled_module_loads_and_renders() {
-        let out = on_render_thread(|| run(SAMPLE, &args(), Duration::from_secs(30)));
+        let out =
+            on_render_thread(|| run(SAMPLE, &args(), Deadline::after(Duration::from_secs(30))));
         assert!(out.failure.is_none(), "{:?}", out.failure);
         let svg = String::from_utf8(out.svg.expect("an SVG")).unwrap();
         assert!(
@@ -298,7 +326,12 @@ mod tests {
         }
         text.push('}');
         let out = on_render_thread(move || {
-            run_with_memory(&text, &args(), Duration::from_secs(60), 9 << 20)
+            run_with_memory(
+                &text,
+                &args(),
+                Deadline::after(Duration::from_secs(60)),
+                9 << 20,
+            )
         });
         assert!(out.svg.is_none());
         let failure = out.failure.expect("a failure message");

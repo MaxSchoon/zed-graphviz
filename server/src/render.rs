@@ -5,10 +5,17 @@ use resvg::{tiny_skia, usvg};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
+/// The largest SVG Graphviz may produce before the render is stopped.
+pub const MAX_SVG_BYTES: usize = 64 << 20;
+/// Overrides `MAX_SVG_BYTES` (used by the tests).
+pub const MAX_SVG_ENV: &str = "GRAPHVIZ_PREVIEW_MAX_SVG_BYTES";
+/// The most Graphviz may write to stderr before the render is stopped.
+pub const MAX_STDERR_BYTES: usize = 1 << 20;
 /// The largest preview we rasterize, in pixels (about 256 MB of RGBA).
 const MAX_PIXELS: f32 = 64_000_000.0;
 /// tiny-skia and most viewers cope with this per side.
@@ -147,31 +154,100 @@ pub struct SvgOutput {
     pub svg: Option<Vec<u8>>,
     pub stderr: String,
     pub timed_out: bool,
-    /// A failure to run Graphviz at all (not a problem in the graph).
+    /// Why there is no SVG when Graphviz itself did not say: it could not
+    /// be started, its output was too large, or it crashed. A full sentence.
     pub failure: Option<String>,
 }
 
-/// Runs Graphviz on `source`, bounded by `timeout`.
+impl SvgOutput {
+    fn failed(message: String) -> Self {
+        SvgOutput {
+            svg: None,
+            stderr: String::new(),
+            timed_out: false,
+            failure: Some(message),
+        }
+    }
+}
+
+/// The largest SVG a render may produce.
+pub fn max_svg_bytes() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var(MAX_SVG_ENV)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(MAX_SVG_BYTES)
+    })
+}
+
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// Stops every render in progress and any later one: running `dot`
+/// processes are killed and the bundled Graphviz is interrupted. Used when
+/// the server shuts down.
+pub fn cancel_all() {
+    CANCELLED.store(true, Ordering::SeqCst);
+    #[cfg(feature = "bundled")]
+    crate::bundled::interrupt();
+}
+
+fn cancelled() -> bool {
+    CANCELLED.load(Ordering::SeqCst)
+}
+
+/// When a render must be finished, checked between its stages.
+#[derive(Clone, Copy, Debug)]
+pub struct Deadline(Instant);
+
+impl Deadline {
+    pub fn after(timeout: Duration) -> Self {
+        Deadline(Instant::now() + timeout)
+    }
+
+    pub fn remaining(self) -> Duration {
+        self.0.saturating_duration_since(Instant::now())
+    }
+
+    /// True once the time is up or the server is shutting down.
+    pub fn passed(self) -> bool {
+        cancelled() || Instant::now() >= self.0
+    }
+}
+
+/// Runs Graphviz on `source`, bounded by `deadline`.
 pub fn render_svg(
     renderer: &Renderer,
     source: &str,
     args: &[String],
-    timeout: Duration,
+    deadline: Deadline,
 ) -> SvgOutput {
+    if cancelled() {
+        return SvgOutput::failed("The server is shutting down.".into());
+    }
     match renderer {
-        Renderer::Dot(path) => run_dot(path, source, args, timeout),
+        Renderer::Dot(path) => run_dot(path, source, args, deadline),
         #[cfg(feature = "bundled")]
-        Renderer::Bundled => crate::bundled::run(source, args, timeout),
+        Renderer::Bundled => crate::bundled::run(source, args, deadline),
     }
 }
 
-fn run_dot(path: &Path, source: &str, args: &[String], timeout: Duration) -> SvgOutput {
-    let failed = |msg: String| SvgOutput {
-        svg: None,
-        stderr: String::new(),
-        timed_out: false,
-        failure: Some(msg),
-    };
+/// Process ids of running `dot` children, for tests and the log.
+static CHILDREN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Ids of the `dot` processes currently running.
+pub fn running_children() -> Vec<u32> {
+    CHILDREN.lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+enum Stop {
+    Exited(std::process::ExitStatus),
+    TimedOut,
+    Cancelled,
+    TooMuchOutput,
+}
+
+fn run_dot(path: &Path, source: &str, args: &[String], deadline: Deadline) -> SvgOutput {
     let mut command = Command::new(path);
     command
         .args(args)
@@ -186,11 +262,19 @@ fn run_dot(path: &Path, source: &str, args: &[String], timeout: Duration) -> Svg
     }
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(e) => return failed(format!("could not start {}: {e}", path.display())),
+        Err(e) => {
+            return SvgOutput::failed(format!(
+                "Graphviz could not run: could not start {}: {e}",
+                path.display()
+            ))
+        }
     };
+    let pid = child.id();
+    CHILDREN.lock().unwrap_or_else(|p| p.into_inner()).push(pid);
 
     // Feed stdin and drain both pipes on their own threads so a large graph
-    // cannot deadlock on a full pipe.
+    // cannot deadlock on a full pipe. A pipe that goes over its cap raises
+    // `overflow`, and the process is killed.
     let stdin = child.stdin.take();
     let input = source.as_bytes().to_vec();
     let writer = std::thread::spawn(move || {
@@ -199,47 +283,115 @@ fn run_dot(path: &Path, source: &str, args: &[String], timeout: Duration) -> Svg
             let _ = stdin.write_all(&input);
         }
     });
-    let stdout = child.stdout.take().map(drain);
-    let stderr = child.stderr.take().map(drain);
+    let overflow = Arc::new(AtomicBool::new(false));
+    let stdout = child
+        .stdout
+        .take()
+        .map(|pipe| drain(pipe, max_svg_bytes(), overflow.clone()));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|pipe| drain(pipe, MAX_STDERR_BYTES, overflow.clone()));
 
-    let status = match child.wait_timeout(timeout) {
-        Ok(Some(status)) => Some(status),
-        Ok(None) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            None
+    // Wait in short slices so a cap, the deadline or a shutdown stops the
+    // process promptly.
+    let stop = loop {
+        let slice = deadline.remaining().min(Duration::from_millis(50));
+        match child.wait_timeout(slice) {
+            Ok(Some(status)) => break Stop::Exited(status),
+            Ok(None) => {}
+            Err(e) => {
+                crate::log(format!("waiting for {} failed: {e}", path.display()));
+                break Stop::Cancelled;
+            }
         }
-        Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return failed(format!("waiting for {} failed: {e}", path.display()));
+        if overflow.load(Ordering::SeqCst) {
+            break Stop::TooMuchOutput;
+        }
+        if cancelled() {
+            break Stop::Cancelled;
+        }
+        if deadline.passed() {
+            break Stop::TimedOut;
         }
     };
+    if !matches!(stop, Stop::Exited(_)) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    CHILDREN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|&p| p != pid);
     let _ = writer.join();
     let stdout = stdout.and_then(|h| h.join().ok()).unwrap_or_default();
     let stderr = stderr.and_then(|h| h.join().ok()).unwrap_or_default();
     let stderr = String::from_utf8_lossy(&stderr).into_owned();
+    let too_much = too_much_output;
 
-    match status {
-        None => SvgOutput {
-            svg: None,
+    match stop {
+        Stop::Exited(_) if overflow.load(Ordering::SeqCst) => SvgOutput {
             stderr,
-            timed_out: true,
-            failure: None,
+            ..SvgOutput::failed(too_much())
         },
-        Some(status) => SvgOutput {
+        Stop::Exited(status) => SvgOutput {
             svg: (status.success() && !stdout.is_empty()).then_some(stdout),
             stderr,
             timed_out: false,
             failure: None,
         },
+        Stop::TimedOut => SvgOutput {
+            svg: None,
+            stderr,
+            timed_out: true,
+            failure: None,
+        },
+        Stop::TooMuchOutput => SvgOutput {
+            stderr,
+            ..SvgOutput::failed(too_much())
+        },
+        Stop::Cancelled => SvgOutput::failed("The render was cancelled.".into()),
     }
 }
 
-fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+/// The message for a render whose output went over the caps.
+pub fn too_much_output() -> String {
+    format!(
+        "Graphviz wrote more than {} of SVG (or 1 MiB of messages); the render was stopped.",
+        human_size(max_svg_bytes())
+    )
+}
+
+fn human_size(bytes: usize) -> String {
+    if bytes >= 1 << 20 {
+        format!("{} MiB", bytes >> 20)
+    } else {
+        format!("{} KiB", bytes >> 10)
+    }
+}
+
+/// Reads `pipe` to the end, keeping at most `cap` bytes; raises `overflow`
+/// and stops reading when there is more.
+fn drain(
+    mut pipe: impl Read + Send + 'static,
+    cap: usize,
+    overflow: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = pipe.read_to_end(&mut buf);
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if buf.len() + n > cap {
+                        overflow.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+            }
+        }
         buf
     })
 }
@@ -302,24 +454,60 @@ pub fn fontdb() -> Arc<usvg::fontdb::Database> {
     .clone()
 }
 
-fn parse_svg(svg: &[u8], resources_dir: Option<&Path>) -> Result<usvg::Tree, String> {
-    let options = usvg::Options {
-        resources_dir: resources_dir.map(Path::to_path_buf),
-        fontdb: fontdb(),
-        ..Default::default()
-    };
-    usvg::Tree::from_data(svg, &options).map_err(|e| format!("could not read Graphviz SVG: {e}"))
+/// Where the SVG may load images from.
+#[derive(Clone, Debug, Default)]
+pub struct ImagePolicy {
+    /// Relative image paths are resolved against this directory (the
+    /// document's folder).
+    pub base: Option<PathBuf>,
+    /// Images must be inside this folder (the workspace folder holding the
+    /// document, else the document's folder). `None` allows no files.
+    pub root: Option<PathBuf>,
+}
+
+/// A rasterized preview.
+pub struct Raster {
+    pub png: Vec<u8>,
+    /// Image references the policy refused to load.
+    pub refused_images: Vec<String>,
+}
+
+pub enum RasterError {
+    TimedOut,
+    Failed(String),
 }
 
 /// Rasterizes `svg` at `scale`, optionally capping the width in pixels.
-/// Huge graphs are scaled down to stay within `MAX_PIXELS`.
+/// Huge graphs are scaled down to stay within `MAX_PIXELS`. The deadline is
+/// checked between parsing, drawing and encoding.
 pub fn svg_to_png(
     svg: &[u8],
     scale: f32,
     max_width: Option<f32>,
-    resources_dir: Option<&Path>,
-) -> Result<Vec<u8>, String> {
-    let tree = parse_svg(svg, resources_dir)?;
+    images: &ImagePolicy,
+    deadline: Deadline,
+) -> Result<Raster, RasterError> {
+    if svg.len() > max_svg_bytes() {
+        return Err(RasterError::Failed(format!(
+            "the SVG is larger than {}",
+            human_size(max_svg_bytes())
+        )));
+    }
+    if deadline.passed() {
+        return Err(RasterError::TimedOut);
+    }
+    let refused = Arc::new(Mutex::new(Vec::new()));
+    let options = usvg::Options {
+        resources_dir: images.base.clone(),
+        fontdb: fontdb(),
+        image_href_resolver: image_resolver(images.root.clone(), refused.clone()),
+        ..Default::default()
+    };
+    let tree = usvg::Tree::from_data(svg, &options)
+        .map_err(|e| RasterError::Failed(format!("could not read Graphviz SVG: {e}")))?;
+    if deadline.passed() {
+        return Err(RasterError::TimedOut);
+    }
     let (w, h) = (tree.size().width(), tree.size().height());
     let mut scale = scale;
     if let Some(max) = max_width {
@@ -332,15 +520,53 @@ pub fn svg_to_png(
     let width = (w * scale).ceil().max(1.0) as u32;
     let height = (h * scale).ceil().max(1.0) as u32;
     let mut pixmap = tiny_skia::Pixmap::new(width, height)
-        .ok_or_else(|| format!("cannot allocate a {width}x{height} image"))?;
+        .ok_or_else(|| RasterError::Failed(format!("cannot allocate a {width}x{height} image")))?;
     resvg::render(
         &tree,
         tiny_skia::Transform::from_scale(scale, scale),
         &mut pixmap.as_mut(),
     );
-    pixmap
+    if deadline.passed() {
+        return Err(RasterError::TimedOut);
+    }
+    let png = pixmap
         .encode_png()
-        .map_err(|e| format!("PNG encoding failed: {e}"))
+        .map_err(|e| RasterError::Failed(format!("PNG encoding failed: {e}")))?;
+    let refused_images = std::mem::take(&mut *refused.lock().unwrap_or_else(|p| p.into_inner()));
+    Ok(Raster {
+        png,
+        refused_images,
+    })
+}
+
+/// Loads `data:` images and image files inside `root`; refuses the rest and
+/// records them in `refused`.
+fn image_resolver(
+    root: Option<PathBuf>,
+    refused: Arc<Mutex<Vec<String>>>,
+) -> usvg::ImageHrefResolver<'static> {
+    let root = root.and_then(|r| r.canonicalize().ok());
+    let load = usvg::ImageHrefResolver::default_string_resolver();
+    usvg::ImageHrefResolver {
+        resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+        resolve_string: Box::new(move |href: &str, options: &usvg::Options| {
+            let path = href.strip_prefix("file://").unwrap_or(href);
+            let path = options.get_abs_path(Path::new(path));
+            let inside = match (&root, path.canonicalize()) {
+                (Some(root), Ok(path)) => path.starts_with(root),
+                _ => false,
+            };
+            if inside {
+                load(href, options)
+            } else {
+                refused
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(href.to_string());
+                None
+            }
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -379,7 +605,7 @@ mod tests {
             &dot(),
             source,
             &graphviz_args(None),
-            Duration::from_secs(10),
+            Deadline::after(Duration::from_secs(10)),
         );
         String::from_utf8(
             out.svg
@@ -423,15 +649,103 @@ mod tests {
         assert!(err.contains("/definitely/not/here/dot"), "{err}");
     }
 
+    fn png(svg: &[u8], scale: f32, max_width: Option<f32>) -> tiny_skia::Pixmap {
+        let deadline = Deadline::after(Duration::from_secs(10));
+        let raster = svg_to_png(svg, scale, max_width, &ImagePolicy::default(), deadline)
+            .unwrap_or_else(|_| panic!("rasterizing failed"));
+        assert_eq!(&raster.png[..8], b"\x89PNG\r\n\x1a\n");
+        tiny_skia::Pixmap::decode_png(&raster.png).unwrap()
+    }
+
     #[test]
     fn png_respects_scale_and_width_cap() {
         let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="white"/></svg>"#;
-        let png = svg_to_png(svg, 2.0, None, None).unwrap();
-        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
-        let decoded = tiny_skia::Pixmap::decode_png(&png).unwrap();
+        let decoded = png(svg, 2.0, None);
         assert_eq!((decoded.width(), decoded.height()), (200, 100));
-        let capped = svg_to_png(svg, 2.0, Some(50.0), None).unwrap();
-        let decoded = tiny_skia::Pixmap::decode_png(&capped).unwrap();
+        let decoded = png(svg, 2.0, Some(50.0));
         assert_eq!((decoded.width(), decoded.height()), (50, 25));
+    }
+
+    #[test]
+    fn a_passed_deadline_stops_rasterizing() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"#;
+        let passed = Deadline::after(Duration::ZERO);
+        let result = svg_to_png(svg, 1.0, None, &ImagePolicy::default(), passed);
+        assert!(matches!(result, Err(RasterError::TimedOut)));
+    }
+
+    #[test]
+    fn images_outside_the_root_are_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        // A 1x1 red PNG.
+        let red = tiny_skia::Pixmap::from_vec(
+            vec![255, 0, 0, 255],
+            tiny_skia::IntSize::from_wh(1, 1).unwrap(),
+        )
+        .unwrap()
+        .encode_png()
+        .unwrap();
+        std::fs::write(root.path().join("in.png"), &red).unwrap();
+        std::fs::write(outside.path().join("out.png"), &red).unwrap();
+        let svg = |href: &str| {
+            format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="10" height="10"><image width="10" height="10" xlink:href="{href}"/></svg>"#
+            )
+        };
+        let policy = ImagePolicy {
+            base: Some(root.path().to_path_buf()),
+            root: Some(root.path().to_path_buf()),
+        };
+        let deadline = Deadline::after(Duration::from_secs(10));
+        let draw = |href: &str| match svg_to_png(svg(href).as_bytes(), 1.0, None, &policy, deadline)
+        {
+            Ok(raster) => raster,
+            Err(_) => panic!("rasterizing failed"),
+        };
+
+        let inside = draw("in.png");
+        assert!(inside.refused_images.is_empty());
+        let pixel = tiny_skia::Pixmap::decode_png(&inside.png)
+            .unwrap()
+            .pixel(5, 5)
+            .unwrap();
+        assert_eq!((pixel.red(), pixel.alpha()), (255, 255));
+
+        let href = outside.path().join("out.png").display().to_string();
+        let refused = draw(&href);
+        assert_eq!(refused.refused_images, vec![href]);
+        let pixel = tiny_skia::Pixmap::decode_png(&refused.png)
+            .unwrap()
+            .pixel(5, 5)
+            .unwrap();
+        assert_eq!(pixel.alpha(), 0, "the outside image was drawn");
+        // `..` cannot climb out of the root either.
+        let climbing = format!(
+            "../{}/out.png",
+            outside.path().file_name().unwrap().to_string_lossy()
+        );
+        assert_eq!(draw(&climbing).refused_images.len(), 1);
+    }
+
+    #[test]
+    fn drain_stops_at_the_cap() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let kept = drain(
+            std::io::Cursor::new(vec![0u8; 3 << 20]),
+            1 << 20,
+            flag.clone(),
+        )
+        .join()
+        .unwrap();
+        assert!(kept.len() <= 1 << 20);
+        assert!(flag.load(Ordering::SeqCst));
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let kept = drain(std::io::Cursor::new(vec![0u8; 1000]), 1 << 20, flag.clone())
+            .join()
+            .unwrap();
+        assert_eq!(kept.len(), 1000);
+        assert!(!flag.load(Ordering::SeqCst));
     }
 }
