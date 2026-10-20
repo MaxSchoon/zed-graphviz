@@ -192,7 +192,7 @@ pub fn cancel_all() {
     crate::bundled::interrupt();
 }
 
-fn cancelled() -> bool {
+pub fn cancelled() -> bool {
     CANCELLED.load(Ordering::SeqCst)
 }
 
@@ -215,20 +215,28 @@ impl Deadline {
     }
 }
 
-/// Runs Graphviz on `source`, bounded by `deadline`.
+/// Runs Graphviz on `source` within `timeout`. Returns the output and the
+/// deadline the later stages must keep: for the bundled Graphviz the budget
+/// starts once the render's turn comes, not while it waits for it.
 pub fn render_svg(
     renderer: &Renderer,
     source: &str,
     args: &[String],
-    deadline: Deadline,
-) -> SvgOutput {
+    timeout: Duration,
+) -> (SvgOutput, Deadline) {
     if cancelled() {
-        return SvgOutput::failed("The server is shutting down.".into());
+        return (
+            SvgOutput::failed("The server is shutting down.".into()),
+            Deadline::after(Duration::ZERO),
+        );
     }
     match renderer {
-        Renderer::Dot(path) => run_dot(path, source, args, deadline),
+        Renderer::Dot(path) => {
+            let deadline = Deadline::after(timeout);
+            (run_dot(path, source, args, deadline), deadline)
+        }
         #[cfg(feature = "bundled")]
-        Renderer::Bundled => crate::bundled::run(source, args, deadline),
+        Renderer::Bundled => crate::bundled::run(source, args, timeout),
     }
 }
 
@@ -601,11 +609,11 @@ mod tests {
     }
 
     fn svg_of(source: &str) -> String {
-        let out = render_svg(
+        let (out, _) = render_svg(
             &dot(),
             source,
             &graphviz_args(None),
-            Deadline::after(Duration::from_secs(10)),
+            Duration::from_secs(10),
         );
         String::from_utf8(
             out.svg

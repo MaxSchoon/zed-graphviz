@@ -840,3 +840,62 @@ fn images_outside_the_workspace_are_not_drawn() {
     assert_eq!(red, 0, "the outside image was drawn");
     client.shutdown();
 }
+
+#[cfg(feature = "bundled")]
+fn bundled_client(timeout_ms: u64) -> (Client, tempfile::TempDir) {
+    let empty = tempfile::tempdir().unwrap();
+    let client = Client::start(Options {
+        settings: json!({"renderer": "bundled", "timeout_ms": timeout_ms}),
+        path_env: Some(empty.path().to_path_buf()),
+        ..Options::default()
+    });
+    (client, empty)
+}
+
+#[cfg(feature = "bundled")]
+#[test]
+fn a_bundled_render_waiting_its_turn_keeps_its_full_budget() {
+    let (mut client, _path) = bundled_client(2000);
+    let small = client.open("small.dot", SAMPLE);
+    client
+        .wait_notification(0, Duration::from_secs(30), diagnostics_for(&small))
+        .expect("diagnostics for the small graph");
+
+    // Two slow graphs take the bundled Graphviz in turn, each for its full
+    // 2 s budget; the preview of the small graph has to wait for both.
+    client.open("big1.dot", &dense_graph());
+    client.open("big2.dot", &dense_graph());
+    client.pump(Duration::from_millis(300));
+    let started = Instant::now();
+    client.command("graphviz.openPreview", &small);
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(3000),
+        "did not wait: {waited:?}"
+    );
+
+    let uris = client.show_document_uris();
+    assert_eq!(
+        uris.len(),
+        1,
+        "no preview after waiting; log:\n{}",
+        client.log()
+    );
+    let image = decode_png(&std::fs::read(path_of(&uris[0])).unwrap());
+    assert!(image.drawn(60.0) > 500);
+    client.shutdown();
+}
+
+#[cfg(feature = "bundled")]
+#[test]
+fn exit_is_prompt_with_bundled_renders_waiting() {
+    let (mut client, _path) = bundled_client(120_000);
+    // One slow render runs and a second waits for its turn.
+    client.open("big1.dot", &dense_graph());
+    client.open("big2.dot", &dense_graph());
+    client.pump(Duration::from_millis(500));
+    let started = Instant::now();
+    client.exit();
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(5), "exit took {took:?}");
+}

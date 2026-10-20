@@ -10,7 +10,7 @@
 use crate::engine_config;
 use crate::render::{self, Deadline, SvgOutput};
 use std::sync::{mpsc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use wasmtime::{Config, Engine, InstancePre, Linker, Module, ResourceLimiter, Store, Trap};
 use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
@@ -124,16 +124,19 @@ pub fn warm_up() {
     let _ = instance();
 }
 
-pub fn run(source: &str, args: &[String], deadline: Deadline) -> SvgOutput {
-    run_with_memory(source, args, deadline, MAX_MEMORY)
+/// Runs the bundled Graphviz. Renders take turns; the `timeout` budget
+/// starts when this render's turn comes, and the returned deadline is the
+/// one the rest of the pipeline must keep.
+pub fn run(source: &str, args: &[String], timeout: Duration) -> (SvgOutput, Deadline) {
+    run_with_memory(source, args, timeout, MAX_MEMORY)
 }
 
 fn run_with_memory(
     source: &str,
     args: &[String],
-    deadline: Deadline,
+    timeout: Duration,
     max_memory: usize,
-) -> SvgOutput {
+) -> (SvgOutput, Deadline) {
     let failed = |msg: String| SvgOutput {
         svg: None,
         stderr: String::new(),
@@ -142,13 +145,30 @@ fn run_with_memory(
     };
     let bundled = match instance() {
         Ok(b) => b,
-        Err(e) => return failed(e),
+        Err(e) => return (failed(e), Deadline::after(Duration::ZERO)),
     };
     let _guard = bundled
         .lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let deadline = Deadline::after(timeout);
+    // A shutdown while this render waited for its turn.
+    if render::cancelled() {
+        return (failed("The render was cancelled.".into()), deadline);
+    }
+    (
+        execute(bundled, source, args, deadline, max_memory),
+        deadline,
+    )
+}
 
+fn execute(
+    bundled: &Bundled,
+    source: &str,
+    args: &[String],
+    deadline: Deadline,
+    max_memory: usize,
+) -> SvgOutput {
     let max_svg = render::max_svg_bytes();
     let stdout = MemoryOutputPipe::new(max_svg);
     let stderr = MemoryOutputPipe::new(render::MAX_STDERR_BYTES);
@@ -286,7 +306,6 @@ fn failure_message(error: &wasmtime::Error, memory_hit: bool, max_memory: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     const SAMPLE: &str = "digraph { alpha -> beta }";
 
@@ -306,8 +325,7 @@ mod tests {
 
     #[test]
     fn precompiled_module_loads_and_renders() {
-        let out =
-            on_render_thread(|| run(SAMPLE, &args(), Deadline::after(Duration::from_secs(30))));
+        let out = on_render_thread(|| run(SAMPLE, &args(), Duration::from_secs(30)).0);
         assert!(out.failure.is_none(), "{:?}", out.failure);
         let svg = String::from_utf8(out.svg.expect("an SVG")).unwrap();
         assert!(
@@ -326,12 +344,7 @@ mod tests {
         }
         text.push('}');
         let out = on_render_thread(move || {
-            run_with_memory(
-                &text,
-                &args(),
-                Deadline::after(Duration::from_secs(60)),
-                9 << 20,
-            )
+            run_with_memory(&text, &args(), Duration::from_secs(60), 9 << 20).0
         });
         assert!(out.svg.is_none());
         let failure = out.failure.expect("a failure message");

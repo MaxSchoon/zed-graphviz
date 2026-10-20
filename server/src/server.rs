@@ -1352,8 +1352,7 @@ fn work(job: Job) -> Event {
     };
     let source = dark_source.as_deref().unwrap_or(&job.text);
     // One deadline covers every stage: Graphviz, parsing, drawing, encoding.
-    let deadline = render::Deadline::after(job.timeout);
-    let out = render::render_svg(&job.renderer, source, &job.args, deadline);
+    let (out, deadline) = render::render_svg(&job.renderer, source, &job.args, job.timeout);
     let svg_ms = started.elapsed().as_millis();
     let started = Instant::now();
     let mut timed_out = out.timed_out;
