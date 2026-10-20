@@ -20,7 +20,7 @@ No Graphviz source code is part of the server.
 | musl (part of wasi-libc) | as in wasi-libc `2e6fb9d8ee0c` | MIT | [licenses/musl-MIT.txt](licenses/musl-MIT.txt) | <https://github.com/WebAssembly/wasi-libc/tree/2e6fb9d8ee0c/libc-top-half/musl> |
 | cloudlibc (part of wasi-libc) | as in wasi-libc `2e6fb9d8ee0c` | BSD-2-Clause | [licenses/cloudlibc-BSD-2-Clause.txt](licenses/cloudlibc-BSD-2-Clause.txt) | <https://github.com/WebAssembly/wasi-libc/tree/2e6fb9d8ee0c/libc-bottom-half/cloudlibc> |
 | dlmalloc (part of wasi-libc) | as in wasi-libc `2e6fb9d8ee0c` | CC0-1.0 | notice in `dlmalloc/src/malloc.c` | <https://github.com/WebAssembly/wasi-libc/tree/2e6fb9d8ee0c/dlmalloc> |
-| LLVM compiler-rt builtins (wasi-sdk 34.0, LLVM 23.1.0) | 23.1.0 | Apache-2.0 WITH LLVM-exception | <https://llvm.org/LICENSE.txt> | <https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-34> |
+| LLVM compiler-rt builtins (wasi-sdk 34.0, LLVM 23.1.0) | 23.1.0 | Apache-2.0 WITH LLVM-exception | [licenses/compiler-rt-Apache-2.0-WITH-LLVM-exception.txt](licenses/compiler-rt-Apache-2.0-WITH-LLVM-exception.txt) | <https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-34> |
 
 Licence texts online:
 
@@ -69,6 +69,13 @@ corresponding source for `graphviz.wasm` is:
 
 Running `./build.sh` rebuilds the module from these sources.
 
+Every release archive of the language server carries `build.sh`, the
+patches and these notices in its `graphviz-wasm/` folder. The same files,
+exactly as used for a release, stay available at the release's tag:
+`https://github.com/gabeins/zed-graphviz/tree/v<version>/server/graphviz-wasm`
+(for example `.../tree/v0.3.0/server/graphviz-wasm`). The archive's copy of
+this file names the exact URL for that release.
+
 ## What EPL-2.0 asks of a release that embeds graphviz.wasm
 
 The language server binaries published on GitHub releases contain
@@ -92,11 +99,12 @@ this directory) must carry a copy of EPL-2.0, which
 [licenses/Graphviz-EPL-2.0.txt](licenses/Graphviz-EPL-2.0.txt) provides.
 
 The MIT and BSD-2-Clause components above require their copyright and
-permission notices to be included with binary copies. In practice each
-release should ship this file and the `licenses/` directory next to the
-binaries (for example in the release archive, or reachable from the server
-with a command-line flag), because users of the extension receive the
-binary through an automatic download and never see the repository.
+permission notices to be included with binary copies. Each release archive
+therefore ships this file, the `licenses/` directory, `build.sh` and the
+patches next to the binary, and the extension unpacks the whole archive, so
+the notices also sit beside the server on users' machines. The licences of
+the Rust crates in the server are listed in the archive's
+`THIRD_PARTY_RUST.md`.
 
 This file describes how the licences apply to this build. It is not legal
 advice.

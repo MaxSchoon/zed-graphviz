@@ -224,3 +224,6 @@ Cargo.lock
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
+
+# Generated for release archives by cargo-about.
+server/THIRD_PARTY_RUST.md
