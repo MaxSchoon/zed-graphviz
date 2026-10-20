@@ -189,6 +189,17 @@ fn execute(
     let mut store = Store::new(&bundled.engine, state);
     store.limiter(|s| &mut s.memory);
     store.set_epoch_deadline(1);
+    // A shutdown interrupts by advancing the epoch, which only reaches a
+    // store whose deadline is already armed. One that came in before this
+    // point would be missed, so look again now that it is armed.
+    if render::cancelled() {
+        return SvgOutput {
+            svg: None,
+            stderr: String::new(),
+            timed_out: false,
+            failure: Some("The render was cancelled.".into()),
+        };
+    }
 
     // Interrupt the guest when the timeout passes; dropping `done` first
     // stops the timer.
