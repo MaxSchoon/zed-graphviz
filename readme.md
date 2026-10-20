@@ -109,13 +109,24 @@ To use your own build of the preview server, put `graphviz-preview` on your
 `PATH`, or set `"lsp": {"graphviz-preview": {"binary": {"path": "..."}}}`;
 Zed itself honours that setting (in trusted projects only), like it does for
 every language server. Otherwise Zed downloads the server for your platform
-from this repository's GitHub releases the first time a DOT file is opened.
+from this repository's GitHub releases the first time a DOT file is opened;
+the extension checks the download against the SHA-256 published with it
+before using it.
+
+Zed only starts language servers in projects you have trusted, so settings
+from a project's own `.zed/settings.json`, such as `dot_path`, take effect
+only in trusted projects.
 
 ### Privacy
 
 Graphs are rendered locally, on your machine. The preview server makes no
 network connections; the only download is the server itself, fetched once
 from GitHub as described above.
+
+Images referenced with `image=` are drawn in the preview only when they are
+inside the workspace folder that holds the `.dot` file (or the file's own
+folder); others are left out with a warning. A system `dot` still opens
+such files to measure them, as it would on the command line.
 
 ### Building the preview server
 
@@ -132,6 +143,14 @@ To build a server that only uses the system `dot`, run
 
 The embedded Graphviz is distributed under its own licence; see
 [`server/graphviz-wasm/THIRD_PARTY_NOTICES.md`](./server/graphviz-wasm/THIRD_PARTY_NOTICES.md).
+
+### Releasing
+
+Pushing a `v<version>` tag that matches `extension.toml` runs the release
+workflow: it runs the CI checks, builds the server for every platform,
+and publishes the archives with their `.sha256` files on a new release.
+It never replaces an existing release or asset. Enable GitHub's immutable
+releases for the repository so published assets cannot be changed later.
 
 ## Acknowledgments
 
